@@ -78,18 +78,20 @@ Rules:
 
 - One rig, one chain. Do not add a second machine to an aggregate, and do not compare a record from
   another machine against this chain.
-- This host exposes more than one GPU, but the WebGPU backend registers a single device named
-  `WebGPU`. Dawn picks the adapter; record the chosen adapter's name/PCI id in
-  `rigs/linux-4090.json` and run the `VULKAN0` reference on the same card. Keep the host otherwise
-  idle so the adapter and its clocks do not change between invocations.
+- This host exposes six RTX 4090s, but the WebGPU backend registers a single device named `WebGPU`.
+  Without pinning, Dawn picks the first adapter (GPU 0); record the chosen adapter's name/PCI id in
+  `rigs/linux-4090.json`. `scripts/gpu-pin.sh <N>` pins a process to GPU `N` via `DRI_PRIME` (Mesa
+  device-select) — used for the per-GPU `--fast` triage lanes; gate records run unpinned on GPU 0.
 - Record the Dawn version, NVIDIA driver version and OS build in `rigs/linux-4090.json`. A Dawn or
   driver bump is a new chain: re-baseline before trusting any delta.
-- **Serialize timed stages; overlap the rest.** One unpinned WebGPU device is shared by every record,
-  so e2e/ops/profile timing must not overlap. Wrap timed commands (`run.sh`, `test-backend-ops perf`,
-  profile runs) in `scripts/gpu-lock.sh`; `run.sh` already self-locks, so a bare `run.sh` invocation is
-  safe. Builds, `test-backend-ops test`, and non-timing pre-checks are safe to run concurrently and
-  must not take the lock — several verification agents may develop/build/pre-check in parallel while
-  their timed stages queue one at a time.
+- **Serialize gate timing; per-GPU for triage.** Full/gate records (`run.sh` without `--fast`, and any
+  promotion/baseline run) share one unpinned device and must not overlap: wrap them in `scripts/gpu-lock.sh`
+  (global lock) or run bare `run.sh`; their numbers must be single-lane. For `--fast` records and timing
+  pre-checks, `WEBGPU_BENCH_GPU=<N> run.sh --fast …` self-locks `.gpu-timing.lock.<N>` and pins to GPU `N`
+  through `DRI_PRIME` (`scripts/gpu-pin.sh`) — concurrent per-GPU lanes run ~95–98% of solo but with higher
+  variance (P001), so gate decisions always come from the global-lock runs. `VK_LOADER_DEVICE_SELECT` does
+  not work on this rig. Builds, `test-backend-ops test`, and non-timing pre-checks take no lock and may run
+  concurrently — several verification agents develop/build/pre-check in parallel while timed stages queue.
 - GPU timestamps are not available on every adapter. If the profile build aborts or reports 0 ms,
   mark `gpu.txt` as `unavailable` and fall back to `host.txt` plus the CPU breakdown.
 

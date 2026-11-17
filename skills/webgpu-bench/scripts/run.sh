@@ -17,8 +17,9 @@ usage: run.sh --tag <tag> [options]
 
 env: WEBGPU_BENCH_ROOT, BENCH_BIN, OPS_BIN, PPL_BIN, PROF_BIN, DEV, REPS, INVOCATIONS, MODELS_MAP
      OPS_INVOCATIONS (default 1), OPS_OPS (override the derived -o list), OPS_PARAMS (extra -p regex)
-     timing lock: run.sh self-locks under $WEBGPU_BENCH_ROOT/.gpu-timing.lock so records never overlap;
-     set WEBGPU_BENCH_LOCK=0 to disable, WEBGPU_LOCK_WAIT=<seconds> for the wait timeout
+     timing lock: full records self-lock $WEBGPU_BENCH_ROOT/.gpu-timing.lock; --fast records may set
+     WEBGPU_BENCH_GPU=<N> to self-lock .gpu-timing.lock.<N> and pin to GPU N (triage only);
+     WEBGPU_BENCH_LOCK=0 disables, WEBGPU_LOCK_WAIT=<seconds> overrides the wait
 EOF
 }
 
@@ -49,12 +50,14 @@ done
 [[ -n "$TAG" ]] || { usage; exit 2; }
 
 REPO_ROOT=$(git rev-parse --show-toplevel)
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=${WEBGPU_BENCH_ROOT:-$HOME/webgpu-bench}
 BENCH_BIN=${BENCH_BIN:-$REPO_ROOT/build/bin/llama-bench}
 OPS_BIN=${OPS_BIN:-$REPO_ROOT/build/bin/test-backend-ops}
 PPL_BIN=${PPL_BIN:-$REPO_ROOT/build/bin/llama-perplexity}
 PROF_BIN=${PROF_BIN:-$REPO_ROOT/build-prof/bin/llama-bench}
 DEV=${DEV:-WebGPU}
+GPU=${WEBGPU_BENCH_GPU:-}
 REPS=${REPS:-5}
 INVOCATIONS=${INVOCATIONS:-3}
 OPS_INVOCATIONS=${OPS_INVOCATIONS:-1}
@@ -66,12 +69,18 @@ MODELS_MAP=${MODELS_MAP:-$ROOT/models.tsv}
 
 RIG=${RIG:-linux-4090}
 
-# Timed tiers share one unpinned WebGPU device, so two records must not overlap. Re-exec under a
-# per-rig lock unless already locked (gpu-lock.sh) or explicitly disabled. This serializes only
-# timing: builds, `test-backend-ops test`, and non-timing pre-checks are not wrapped and stay
-# concurrent across worktrees.
+# Timed tiers finalize the same numbers, so gate/full records must not overlap: they use one global
+# lock. --fast records and timing pre-checks may run on per-device locks + DRI_PRIME pinning
+# (WEBGPU_BENCH_GPU=<N>) for triage; that is faster but higher-variance (P001), so gate decisions
+# always come from global-lock runs. Non-timing work (builds, `test-backend-ops test`) needs no lock.
 if [[ $DRY -eq 0 && -z "${WEBGPU_BENCH_LOCKED:-}" && "${WEBGPU_BENCH_LOCK:-1}" != 0 ]]; then
     LOCK_FILE=${WEBGPU_BENCH_LOCK_FILE:-$ROOT/.gpu-timing.lock}
+    if [[ $FAST -eq 1 && -n "$GPU" ]]; then
+        LOCK_FILE=$ROOT/.gpu-timing.lock.$GPU
+        eval "$("$HERE/gpu-pin.sh" env "$GPU")"
+    elif [[ -n "$GPU" ]]; then
+        echo "run.sh: WEBGPU_BENCH_GPU=$GPU ignored for full records (global lock)" >&2
+    fi
     if command -v flock >/dev/null; then
         export WEBGPU_BENCH_LOCKED=1
         mkdir -p "$(dirname "$LOCK_FILE")"
