@@ -14,7 +14,7 @@ usage: run.sh --tag <tag> [options]
   --fetch-corpus     download the wikitext-2 corpus if missing
   --dry-run          print the commands, write nothing
 
-env: WEBGPU_BENCH_ROOT, BENCH_BIN, OPS_BIN, PPL_BIN, PROF_BIN, DEV, REPS, INVOCATIONS
+env: WEBGPU_BENCH_ROOT, BENCH_BIN, OPS_BIN, PPL_BIN, PROF_BIN, DEV, REPS, INVOCATIONS, MODELS_MAP
 EOF
 }
 
@@ -53,6 +53,7 @@ REPS=${REPS:-5}
 INVOCATIONS=${INVOCATIONS:-3}
 CASES=${CASES:-$REPO_ROOT/skills/webgpu-bench/scripts/cases.tsv}
 CORPUS=${PPL_CORPUS:-$ROOT/corpus/wiki.test.raw}
+MODELS_MAP=${MODELS_MAP:-$ROOT/models.tsv}
 
 RIG=${RIG:-linux-4090}
 
@@ -89,9 +90,18 @@ if [[ $DRY -eq 0 ]]; then
 fi
 
 # one invocation per case keeps the profile tier and the per-case noise honest
+# a curl-off build cannot resolve -hf; an optional models.tsv (repo<TAB>path) maps ids to files
 model_args() {
     if [[ "$1" == /* || "$1" == .* ]]; then
         MARG=(-m "$1")
+        return
+    fi
+    local path=""
+    if [[ -f "$MODELS_MAP" ]]; then
+        path=$(awk -F'\t' -v key="$1" '!/^#/ && $1==key {print $2; exit}' "$MODELS_MAP")
+    fi
+    if [[ -n "$path" ]]; then
+        MARG=(-m "$path")
     else
         MARG=(-hf "$1")
     fi

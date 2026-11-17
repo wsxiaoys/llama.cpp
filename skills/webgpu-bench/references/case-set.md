@@ -47,7 +47,10 @@ Common flags: `-ngl 99 -fa on -ctk f16 -ctv f16 -b 2048 -ub 512 -r 5 -dev WebGPU
 ```
 
 `-hf` downloads once into the HF cache. `run.sh` passes the resolved path from the JSON
-`model_filename` field into `meta.json`, so later runs can use `-m <path>` and skip the lookup.
+`model_filename` field into `meta.json`, so later runs can use `-m <path>` and skip the lookup. A
+curl-off build (`-DLLAMA_CURL=OFF`) cannot resolve `-hf`: pre-download the repos and map each id to
+a local file in `$WEBGPU_BENCH_ROOT/models.tsv` (`repo<TAB>path`), which `run.sh` consults first
+(override the path with `MODELS_MAP`).
 
 ## Deriving the op set
 

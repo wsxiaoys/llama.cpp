@@ -5,6 +5,7 @@
 ```
 $WEBGPU_BENCH_ROOT/                      default ~/webgpu-bench
   rigs/<rig>.json                        machine, GPU, driver, Dawn, OS, build flags
+  models.tsv                             repo<TAB>path map for curl-off builds (optional)
   runs/linux-4090/<YYYYMMDD>-<commit8>-<tag>/
     meta.json
     status.json

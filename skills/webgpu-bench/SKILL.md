@@ -90,17 +90,29 @@ Rules:
 ## Build configs
 
 ```
-bench          -DGGML_WEBGPU=ON -DCMAKE_BUILD_TYPE=Release
-bench+profile  -DGGML_WEBGPU=ON -DCMAKE_BUILD_TYPE=Release \
+bench          -DGGML_WEBGPU=ON -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release
+bench+profile  -DGGML_WEBGPU=ON -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release \
                -DGGML_WEBGPU_CPU_PROFILE=ON -DGGML_WEBGPU_GPU_PROFILE=ON
 # optional: add -DGGML_VULKAN=ON to either config to enable the Tier C VULKAN0 reference device
 ```
 
+Dawn is consumed as a prebuilt static package. Extract the release asset for the pinned Dawn
+commit into a local prefix (no root needed) and point CMake at it:
+
+```sh
+Dawn_DIR=$PREFIX/dawn/lib64/cmake/Dawn CMAKE_PREFIX_PATH=$PREFIX/dawn \
+    cmake -B build -DGGML_WEBGPU=ON -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release
+```
+
 On Linux Dawn runs on Vulkan, so the timed build needs `libvulkan.so.1` and the NVIDIA ICD at
-runtime, and the Dawn package itself: the build finds it through `find_package(Dawn)`, so point
-`CMAKE_PREFIX_PATH` at the Dawn install. `-DGGML_VULKAN=ON` is only needed for the `VULKAN0`
-reference run and pulls in the Vulkan SDK (`glslc`, Vulkan headers); without it `ref_ts` is `n/a`.
-It never changes WebGPU timing - the two devices share the one NVIDIA driver.
+runtime; a headless build needs no X11/xcb/GLES because Dawn `dlopen`s the loader. `-DGGML_VULKAN=ON`
+is only needed for the `VULKAN0` reference run and pulls in the Vulkan SDK (`glslc`, Vulkan
+headers); without it `ref_ts` is `n/a`. It never changes WebGPU timing - the two devices share the
+one NVIDIA driver.
+
+`-DLLAMA_CURL=OFF` removes the libcurl/libssl build dependency, which is the no-root path when the
+`-dev` headers are not installed. It also disables `-hf`, so models are fetched out of band and
+supplied as local paths (see "Offline models" below).
 
 Timed runs use `bench` only. The profile build adds per-batch query resolves and buffer maps, which
 change the timing by a lot, especially for tg. Never compare across configs, and never publish a
@@ -227,6 +239,20 @@ skills/webgpu-bench/scripts/run.sh --tag base        # tag = base | E00N-<slug>
 `run.sh` writes `meta.json`, runs the invocations, derives the op set from the graph, runs the op
 tier, and leaves `status.json` as `draft`. A human (or the hill-climb parent) promotes it to
 `accepted` after the gates pass.
+
+### Offline models (`-DLLAMA_CURL=OFF`)
+
+A curl-off build cannot resolve `-hf`, so models must be fetched out of band and given as paths.
+Download each model pinned by `scripts/cases.tsv` once, then write a map at
+`$WEBGPU_BENCH_ROOT/models.tsv` (override with `MODELS_MAP`), one row per case model:
+
+```
+Qwen/Qwen3-0.6B-GGUF:Q8_0<TAB>/path/to/Qwen3-0.6B-Q8_0.gguf
+```
+
+`run.sh` resolves a case's model id through that file and uses `-m <path>`; a case model that is
+already a path (`/...` or `./...`) is passed straight through, and anything unmapped falls back to
+`-hf`. `meta.json` still records the resolved path and sha256, so a record is self-describing.
 
 Profiles are separate, one case per invocation, and use the `bench+profile` binary. The flags are
 compile-time, so there is no env var to set. Both summaries go to stdout, so capture stdout and
