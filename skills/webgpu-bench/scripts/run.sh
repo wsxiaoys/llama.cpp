@@ -17,6 +17,8 @@ usage: run.sh --tag <tag> [options]
 
 env: WEBGPU_BENCH_ROOT, BENCH_BIN, OPS_BIN, PPL_BIN, PROF_BIN, DEV, REPS, INVOCATIONS, MODELS_MAP
      OPS_INVOCATIONS (default 1), OPS_OPS (override the derived -o list), OPS_PARAMS (extra -p regex)
+     timing lock: run.sh self-locks under $WEBGPU_BENCH_ROOT/.gpu-timing.lock so records never overlap;
+     set WEBGPU_BENCH_LOCK=0 to disable, WEBGPU_LOCK_WAIT=<seconds> for the wait timeout
 EOF
 }
 
@@ -63,6 +65,21 @@ CORPUS=${PPL_CORPUS:-$ROOT/corpus/wiki.test.raw}
 MODELS_MAP=${MODELS_MAP:-$ROOT/models.tsv}
 
 RIG=${RIG:-linux-4090}
+
+# Timed tiers share one unpinned WebGPU device, so two records must not overlap. Re-exec under a
+# per-rig lock unless already locked (gpu-lock.sh) or explicitly disabled. This serializes only
+# timing: builds, `test-backend-ops test`, and non-timing pre-checks are not wrapped and stay
+# concurrent across worktrees.
+if [[ $DRY -eq 0 && -z "${WEBGPU_BENCH_LOCKED:-}" && "${WEBGPU_BENCH_LOCK:-1}" != 0 ]]; then
+    LOCK_FILE=${WEBGPU_BENCH_LOCK_FILE:-$ROOT/.gpu-timing.lock}
+    if command -v flock >/dev/null; then
+        export WEBGPU_BENCH_LOCKED=1
+        mkdir -p "$(dirname "$LOCK_FILE")"
+        exec flock -w "${WEBGPU_LOCK_WAIT:-7200}" "$LOCK_FILE" "$0" "$@"
+    else
+        echo "run.sh: flock not found; running without the timing lock" >&2
+    fi
+fi
 
 COMMIT=$(git -C "$REPO_ROOT" rev-parse --short=8 HEAD)
 DIRTY=0

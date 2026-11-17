@@ -84,6 +84,12 @@ Rules:
   idle so the adapter and its clocks do not change between invocations.
 - Record the Dawn version, NVIDIA driver version and OS build in `rigs/linux-4090.json`. A Dawn or
   driver bump is a new chain: re-baseline before trusting any delta.
+- **Serialize timed stages; overlap the rest.** One unpinned WebGPU device is shared by every record,
+  so e2e/ops/profile timing must not overlap. Wrap timed commands (`run.sh`, `test-backend-ops perf`,
+  profile runs) in `scripts/gpu-lock.sh`; `run.sh` already self-locks, so a bare `run.sh` invocation is
+  safe. Builds, `test-backend-ops test`, and non-timing pre-checks are safe to run concurrently and
+  must not take the lock — several verification agents may develop/build/pre-check in parallel while
+  their timed stages queue one at a time.
 - GPU timestamps are not available on every adapter. If the profile build aborts or reports 0 ms,
   mark `gpu.txt` as `unavailable` and fall back to `host.txt` plus the CPU breakdown.
 
