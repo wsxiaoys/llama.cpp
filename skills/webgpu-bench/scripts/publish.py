@@ -27,6 +27,26 @@ def case_medians(summary):
     return out
 
 
+def case_set_table(meta):
+    """Markdown rows mapping every case to the model/quant it runs, from meta.json."""
+    cases = meta.get("cases", [])
+    if not cases:
+        return []
+    models = meta.get("models", {})
+    out = ["## case set (models)", "",
+           "| id | model | quant | params | role | sha256 |", "|---|---|---|---|---|---|"]
+    for c in cases:
+        ref = c.get("model", "?")
+        repo, _, quant = ref.rpartition(":")
+        if not repo:
+            repo, quant = ref, ""
+        params = " ".join("%s%d" % (k, c[k]) for k in ("p", "n", "d") if c.get(k))
+        sha = models.get(ref, {}).get("sha256", "")[:12]
+        out.append("| %s | %s | %s | %s | %s | %s |" % (
+            c.get("id", "?"), repo, quant, params, c.get("role", ""), sha))
+    return out
+
+
 def read_record(rec):
     with open(os.path.join(rec, "status.json")) as f:
         status = json.load(f).get("status")
@@ -97,6 +117,10 @@ def main():
                 lines.append("| %s | %s | %.2f | %.2f | %+.1f%% |" % (cid, name, b, l, 100 * (l / b - 1)))
         lines.append("| **G** | geomean over cases | %.2f | %.2f | %+.1f%% |" % (
             first["g"], last["g"], 100 * (last["g"] / first["g"] - 1)))
+
+    cst = case_set_table(last["meta"])
+    if cst:
+        lines += [""] + cst
 
     body = "\n".join(records[-1]["summary"].splitlines()[1:]).strip()
     lines += ["", "## latest", "", body, ""]
