@@ -1096,9 +1096,10 @@ struct ggml_webgpu_mul_mat_shader_decisions {
 
 struct ggml_webgpu_mul_mat_id_gather_pipeline_key {
     uint32_t n_experts;
+    uint32_t tile_n_slots;
 
     bool operator==(const ggml_webgpu_mul_mat_id_gather_pipeline_key & other) const {
-        return n_experts == other.n_experts;
+        return n_experts == other.n_experts && tile_n_slots == other.tile_n_slots;
     }
 };
 
@@ -1106,6 +1107,7 @@ struct ggml_webgpu_mul_mat_id_gather_pipeline_key_hash {
     size_t operator()(const ggml_webgpu_mul_mat_id_gather_pipeline_key & key) const {
         size_t seed = 0;
         ggml_webgpu_hash_combine(seed, key.n_experts);
+        ggml_webgpu_hash_combine(seed, key.tile_n_slots);
         return seed;
     }
 };
@@ -1116,10 +1118,12 @@ struct ggml_webgpu_mul_mat_id_pipeline_key {
     uint32_t  n_experts;
     uint32_t  num_cols;
     int       vectorized;
+    int       use_subgroup_matrix;
 
     bool operator==(const ggml_webgpu_mul_mat_id_pipeline_key & other) const {
         return src0_type == other.src0_type && src1_type == other.src1_type && n_experts == other.n_experts &&
-               num_cols == other.num_cols && vectorized == other.vectorized;
+               num_cols == other.num_cols && vectorized == other.vectorized &&
+               use_subgroup_matrix == other.use_subgroup_matrix;
     }
 };
 
@@ -1131,6 +1135,7 @@ struct ggml_webgpu_mul_mat_id_pipeline_key_hash {
         ggml_webgpu_hash_combine(seed, key.n_experts);
         ggml_webgpu_hash_combine(seed, key.num_cols);
         ggml_webgpu_hash_combine(seed, key.vectorized);
+        ggml_webgpu_hash_combine(seed, key.use_subgroup_matrix);
         return seed;
     }
 };
@@ -2509,9 +2514,11 @@ class ggml_webgpu_shader_lib {
         return mul_mat_fast_pipelines[key];
     }
 
-    webgpu_pipeline get_mul_mat_id_gather_pipeline(const ggml_webgpu_shader_lib_context & context) {
+    webgpu_pipeline get_mul_mat_id_gather_pipeline(const ggml_webgpu_shader_lib_context & context,
+                                                   uint32_t                               tile_n_slots) {
         ggml_webgpu_mul_mat_id_gather_pipeline_key key = {};
         key.n_experts                                  = (uint32_t) context.src0->ne[2];
+        key.tile_n_slots                               = tile_n_slots;
 
         auto it = mul_mat_id_gather_pipelines.find(key);
         if (it != mul_mat_id_gather_pipelines.end()) {
@@ -2520,8 +2527,7 @@ class ggml_webgpu_shader_lib {
         std::vector<std::string> defines;
         defines.push_back(std::string("WG_SIZE=") + std::to_string(context.max_wg_size) + "u");
         defines.push_back(std::string("N_EXPERT=") + std::to_string(key.n_experts) + "u");
-        defines.push_back(std::string("TILE_N_SLOTS=") +
-                          std::to_string(WEBGPU_MUL_MAT_TILE_N * WEBGPU_MUL_MAT_WG_SIZE_N) + "u");
+        defines.push_back(std::string("TILE_N_SLOTS=") + std::to_string(key.tile_n_slots) + "u");
 
         auto processed     = preprocessor.preprocess(wgsl_mul_mat_id_gather, defines);
         auto decisions     = std::make_shared<ggml_webgpu_generic_shader_decisions>();
@@ -2538,10 +2544,13 @@ class ggml_webgpu_shader_lib {
         key.src0_type                           = context.src0->type;
         key.src1_type                           = context.src1->type;
         key.n_experts                           = context.src0->ne[2];
-        key.vectorized = (context.src0->ne[0] % 4 == 0 && context.src0->ne[1] % 4 == 0 &&
-                          (context.src0->type == GGML_TYPE_F32 || context.src0->type == GGML_TYPE_F16)) ?
-                             1 :
-                             0;
+        key.vectorized          = (context.src0->ne[0] % 4 == 0 && context.src0->ne[1] % 4 == 0 &&
+                                   (context.src0->type == GGML_TYPE_F32 || context.src0->type == GGML_TYPE_F16)) ?
+                                      1 :
+                                      0;
+        // Quantized src0 can reuse the dense subgroup-matrix core with an id-aware gather/scatter.
+        key.use_subgroup_matrix = context.supports_subgroup_matrix && ggml_is_quantized(context.src0->type) &&
+                                  context.sg_mat_k != 0 && context.src0->ne[0] % context.sg_mat_k == 0;
 
         auto it = mul_mat_id_pipelines.find(key);
         if (it != mul_mat_id_pipelines.end()) {
@@ -2549,7 +2558,8 @@ class ggml_webgpu_shader_lib {
         }
 
         std::vector<std::string> defines;
-        std::string              variant = "mul_mat_id";
+        std::string              variant    = key.use_subgroup_matrix ? "mul_mat_id_subgroup_matrix" : "mul_mat_id";
+        const char *             shader_src = key.use_subgroup_matrix ? wgsl_mul_mat_subgroup_matrix : wgsl_mul_mat_id;
         defines.push_back("MUL_MAT_ID");
 
         // src1 type
@@ -2632,17 +2642,31 @@ class ggml_webgpu_shader_lib {
         // VEC/SCALAR controls
         defines.push_back(key.vectorized ? "VEC" : "SCALAR");
 
-        // mul_mat_id is register-tile only.
-        const uint32_t tile_k =
-            ggml_is_quantized(context.src0->type) ? WEBGPU_MUL_MAT_REG_TILE_K_QUANT : WEBGPU_MUL_MAT_REG_TILE_K_FLOAT;
+        uint32_t tile_k;
+        if (key.use_subgroup_matrix) {
+            tile_k = WEBGPU_MUL_MAT_SUBGROUP_TILE_K_QUANT;
 
-        // Tiles
-        defines.push_back("TILE_M=" + std::to_string(WEBGPU_MUL_MAT_TILE_M) + "u");
-        defines.push_back("TILE_N=" + std::to_string(WEBGPU_MUL_MAT_TILE_N) + "u");
-        defines.push_back("TILE_K=" + std::to_string(tile_k) + "u");
+            defines.push_back("TILE_K=" + std::to_string(tile_k) + "u");
+            defines.push_back("MAX_SUBGROUP_SIZE=" + std::to_string(context.max_subgroup_size) + "u");
+            defines.push_back("SUBGROUP_M=" + std::to_string(WEBGPU_MUL_MAT_SUBGROUP_M) + "u");
+            defines.push_back("SUBGROUP_N=" + std::to_string(WEBGPU_MUL_MAT_SUBGROUP_N) + "u");
+            defines.push_back("SUBGROUP_MATRIX_M=" + std::to_string(WEBGPU_MUL_MAT_SUBGROUP_MATRIX_M) + "u");
+            defines.push_back("SUBGROUP_MATRIX_N=" + std::to_string(WEBGPU_MUL_MAT_SUBGROUP_MATRIX_N) + "u");
+            defines.push_back("SUBGROUP_MATRIX_M_SIZE=" + std::to_string(context.sg_mat_m) + "u");
+            defines.push_back("SUBGROUP_MATRIX_N_SIZE=" + std::to_string(context.sg_mat_n) + "u");
+            defines.push_back("SUBGROUP_MATRIX_K_SIZE=" + std::to_string(context.sg_mat_k) + "u");
+        } else {
+            tile_k = ggml_is_quantized(context.src0->type) ? WEBGPU_MUL_MAT_REG_TILE_K_QUANT :
+                                                             WEBGPU_MUL_MAT_REG_TILE_K_FLOAT;
 
-        defines.push_back("WORKGROUP_SIZE_M=" + std::to_string(WEBGPU_MUL_MAT_WG_SIZE_M) + "u");
-        defines.push_back("WORKGROUP_SIZE_N=" + std::to_string(WEBGPU_MUL_MAT_WG_SIZE_N) + "u");
+            // Tiles
+            defines.push_back("TILE_M=" + std::to_string(WEBGPU_MUL_MAT_TILE_M) + "u");
+            defines.push_back("TILE_N=" + std::to_string(WEBGPU_MUL_MAT_TILE_N) + "u");
+            defines.push_back("TILE_K=" + std::to_string(tile_k) + "u");
+
+            defines.push_back("WORKGROUP_SIZE_M=" + std::to_string(WEBGPU_MUL_MAT_WG_SIZE_M) + "u");
+            defines.push_back("WORKGROUP_SIZE_N=" + std::to_string(WEBGPU_MUL_MAT_WG_SIZE_N) + "u");
+        }
 
         // variant suffix for src1 type
         variant += std::string("_") + (context.src1->type == GGML_TYPE_F32 ? "f32" : "f16");
@@ -2650,15 +2674,24 @@ class ggml_webgpu_shader_lib {
             variant += "_vectorized";
         }
 
-        auto processed = preprocessor.preprocess(wgsl_mul_mat_id, defines);
+        auto processed = preprocessor.preprocess(shader_src, defines);
 
-        auto decisions       = std::make_shared<ggml_webgpu_mul_mat_shader_decisions>();
-        decisions->tile_k    = tile_k;
-        decisions->tile_m    = WEBGPU_MUL_MAT_TILE_M;
-        decisions->tile_n    = WEBGPU_MUL_MAT_TILE_N;
-        decisions->wg_size_m = WEBGPU_MUL_MAT_WG_SIZE_M;
-        decisions->wg_size_n = WEBGPU_MUL_MAT_WG_SIZE_N;
-        decisions->wg_size   = WEBGPU_MUL_MAT_WG_SIZE_M * WEBGPU_MUL_MAT_WG_SIZE_N;
+        auto decisions                 = std::make_shared<ggml_webgpu_mul_mat_shader_decisions>();
+        decisions->tile_k              = tile_k;
+        decisions->tile_m              = WEBGPU_MUL_MAT_TILE_M;
+        decisions->tile_n              = WEBGPU_MUL_MAT_TILE_N;
+        decisions->use_subgroup_matrix = key.use_subgroup_matrix;
+        if (key.use_subgroup_matrix) {
+            decisions->subgroup_m        = WEBGPU_MUL_MAT_SUBGROUP_M;
+            decisions->subgroup_n        = WEBGPU_MUL_MAT_SUBGROUP_N;
+            decisions->subgroup_matrix_m = WEBGPU_MUL_MAT_SUBGROUP_MATRIX_M;
+            decisions->subgroup_matrix_n = WEBGPU_MUL_MAT_SUBGROUP_MATRIX_N;
+            decisions->wg_size           = context.max_subgroup_size;
+        } else {
+            decisions->wg_size_m = WEBGPU_MUL_MAT_WG_SIZE_M;
+            decisions->wg_size_n = WEBGPU_MUL_MAT_WG_SIZE_N;
+            decisions->wg_size   = WEBGPU_MUL_MAT_WG_SIZE_M * WEBGPU_MUL_MAT_WG_SIZE_N;
+        }
 
         webgpu_pipeline pipeline  = ggml_webgpu_create_pipeline(device, processed, variant);
         pipeline.context          = decisions;
