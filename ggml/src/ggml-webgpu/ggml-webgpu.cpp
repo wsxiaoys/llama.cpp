@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #ifdef GGML_WEBGPU_GPU_PROFILE
 #    include <iomanip>
@@ -29,6 +30,8 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -254,6 +257,25 @@ struct webgpu_global_context_struct {
 
 typedef std::shared_ptr<webgpu_global_context_struct> webgpu_global_context;
 
+// One backend-owned scratch buffer holds the q8_1 copies of activations shared by the MMVQ
+// consumers of a graph_compute. The copies cannot live in a producer's dst tail: the graph
+// allocator recycles that chunk once the producer's last consumer is processed, while the other
+// consumers of the same activation are still pending.
+#define WEBGPU_Q8_CACHE_MAX_SLOTS 256u
+
+struct webgpu_q8_region {
+    wgpu::Buffer buffer;
+    size_t       offset = 0;
+    size_t       size   = 0;
+    bool         hit    = false;
+};
+
+// Pre-check counters, see GGML_WEBGPU_Q8_REUSE_STATS in ggml_webgpu_mul_mat.
+static bool ggml_webgpu_q8_reuse_stats_enabled() {
+    static const bool enabled = std::getenv("GGML_WEBGPU_Q8_REUSE_STATS") != nullptr;
+    return enabled;
+}
+
 // All the base objects needed to run operations on a WebGPU device
 struct webgpu_context_struct {
     // Points to global instances owned by ggml_backend_webgpu_reg_context
@@ -268,6 +290,24 @@ struct webgpu_context_struct {
     wgpu::ComputePassEncoder active_compute_pass;
     bool                     batch_compute_passes = true;
 
+    // q8_1 copies of src1 shared by its MMVQ consumers; valid inside one graph_compute only
+    wgpu::Buffer                                      q8_cache_buf;
+    std::vector<wgpu::Buffer>                         q8_cache_retired;
+    size_t                                            q8_cache_stride   = 0;
+    uint32_t                                          q8_cache_capacity = 0;
+    std::unordered_map<const ggml_tensor *, uint32_t> q8_cache_slot;
+    std::vector<const ggml_tensor *>                  q8_cache_owner;
+    std::vector<uint64_t>                             q8_cache_tick;
+    uint64_t                                          q8_cache_clock = 0;
+
+    // pre-check counters, see GGML_WEBGPU_Q8_REUSE_STATS in ggml_webgpu_mul_mat
+    uint64_t                                q8_stat_mmvq        = 0;
+    uint64_t                                q8_stat_cacheable   = 0;
+    uint64_t                                q8_stat_emitted     = 0;
+    uint64_t                                q8_stat_cacheable_k = 0;
+    uint64_t                                q8_stat_distinct_k  = 0;
+    std::unordered_set<const ggml_tensor *> q8_stat_distinct;
+
 #ifdef GGML_WEBGPU_GPU_PROFILE
     // Profiling: per-shader GPU time in ms
     std::unordered_map<std::string, double> shader_gpu_time_ms;
@@ -278,6 +318,14 @@ struct webgpu_context_struct {
 #endif
 
     ~webgpu_context_struct() {
+        if (this->q8_cache_buf) {
+            this->q8_cache_buf.Destroy();
+            this->q8_cache_buf = nullptr;
+        }
+        for (wgpu::Buffer & retired : this->q8_cache_retired) {
+            retired.Destroy();
+        }
+        this->q8_cache_retired.clear();
 #ifdef GGML_WEBGPU_GPU_PROFILE
         if (this->profile_timestamp_host_buf) {
             this->profile_timestamp_host_buf.Destroy();
@@ -492,6 +540,85 @@ static wgpu::BindGroupEntry ggml_webgpu_make_tensor_bind_group_entry(webgpu_cont
     return ggml_webgpu_make_bind_group_entry(binding, ggml_webgpu_tensor_buf(tensor),
                                              ggml_webgpu_tensor_align_offset(ctx, tensor),
                                              ggml_webgpu_tensor_binding_size(ctx, tensor));
+}
+
+// Binding size of the q8_1 copy the quantize shader writes for one activation. This is the size of
+// one cache slot and matches the binding size ggml_webgpu_quantize_q8_dispatch computes.
+static size_t ggml_webgpu_q8_copy_size(const ggml_tensor * src1) {
+    return ROUNDUP_POW2(src1->ne[3] * src1->ne[2] * src1->ne[1] * (36 /* sizeof(q8_1) */ * (src1->ne[0] / 32)),
+                        WEBGPU_STORAGE_BUF_BINDING_MULT);
+}
+
+// (Re)allocate the scratch buffer so that one slot holds `stride` bytes. A copy of the old buffer
+// is kept alive because commands encoded before this point may still reference it; the cache is
+// invalidated, so a miss simply re-quantizes.
+static void ggml_webgpu_q8_cache_grow(webgpu_context & ctx, size_t stride) {
+    const size_t alignment = ctx->global_ctx->capabilities.limits.minStorageBufferOffsetAlignment;
+    stride                 = ROUNDUP_POW2(stride, alignment);
+
+    wgpu::Buffer buf;
+    ggml_webgpu_create_buffer(ctx->global_ctx->device, buf, stride * WEBGPU_Q8_CACHE_MAX_SLOTS,
+                              wgpu::BufferUsage::Storage, "ggml_webgpu_q8_cache");
+
+    if (ctx->q8_cache_buf) {
+        ctx->q8_cache_retired.push_back(ctx->q8_cache_buf);
+    }
+    ctx->q8_cache_buf      = buf;
+    ctx->q8_cache_stride   = stride;
+    ctx->q8_cache_capacity = WEBGPU_Q8_CACHE_MAX_SLOTS;
+    ctx->q8_cache_slot.clear();
+    ctx->q8_cache_owner.assign(WEBGPU_Q8_CACHE_MAX_SLOTS, nullptr);
+    ctx->q8_cache_tick.assign(WEBGPU_Q8_CACHE_MAX_SLOTS, 0);
+    ctx->q8_cache_clock = 0;
+}
+
+// Drop every cached copy; the scratch buffer itself is reused by the next graph.
+static void ggml_webgpu_q8_cache_clear(webgpu_context & ctx) {
+    ctx->q8_cache_slot.clear();
+    if (ctx->q8_cache_capacity > 0) {
+        ctx->q8_cache_owner.assign(ctx->q8_cache_capacity, nullptr);
+        ctx->q8_cache_tick.assign(ctx->q8_cache_capacity, 0);
+    }
+    ctx->q8_cache_clock = 0;
+}
+
+// Return the slot holding src1's q8_1 copy, or reserve one for the caller to quantize into. A hit
+// means a copy of the same activation already exists in this graph_compute.
+static webgpu_q8_region ggml_webgpu_q8_cache_acquire(webgpu_context & ctx, const ggml_tensor * src1) {
+    const size_t need = ggml_webgpu_q8_copy_size(src1);
+    if (need > ctx->q8_cache_stride) {
+        ggml_webgpu_q8_cache_grow(ctx, need);
+    }
+
+    const auto it = ctx->q8_cache_slot.find(src1);
+    if (it != ctx->q8_cache_slot.end()) {
+        const uint32_t slot      = it->second;
+        ctx->q8_cache_tick[slot] = ++ctx->q8_cache_clock;
+        return { ctx->q8_cache_buf, (size_t) slot * ctx->q8_cache_stride, need, true };
+    }
+
+    uint32_t slot = ctx->q8_cache_capacity;
+    for (uint32_t i = 0; i < ctx->q8_cache_capacity; ++i) {
+        if (ctx->q8_cache_owner[i] == nullptr) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot == ctx->q8_cache_capacity) {
+        // every slot is live: evict the least recently used one (a miss simply re-quantizes)
+        uint64_t oldest = UINT64_MAX;
+        for (uint32_t i = 0; i < ctx->q8_cache_capacity; ++i) {
+            if (ctx->q8_cache_tick[i] < oldest) {
+                oldest = ctx->q8_cache_tick[i];
+                slot   = i;
+            }
+        }
+        ctx->q8_cache_slot.erase(ctx->q8_cache_owner[slot]);
+    }
+    ctx->q8_cache_owner[slot] = src1;
+    ctx->q8_cache_tick[slot]  = ++ctx->q8_cache_clock;
+    ctx->q8_cache_slot[src1]  = slot;
+    return { ctx->q8_cache_buf, (size_t) slot * ctx->q8_cache_stride, need, false };
 }
 
 /** End WebGPU object initializations */
@@ -1627,28 +1754,26 @@ static webgpu_encoded_op ggml_webgpu_get_rows(webgpu_context & ctx,
     return ggml_backend_webgpu_build(ctx, pipeline, params, entries, wg_x, wg_y);
 }
 
-static void ggml_webgpu_quantize_q8_dispatch(webgpu_context &                    ctx,
-                                             ggml_tensor *                       src0,
-                                             ggml_tensor *                       src1,
-                                             ggml_tensor *                       dst,
-                                             std::vector<webgpu_dispatch_desc> & dispatches) {
+static void ggml_webgpu_quantize_q8_dispatch_into(webgpu_context &                    ctx,
+                                                  ggml_tensor *                       src0,
+                                                  ggml_tensor *                       src1,
+                                                  wgpu::Buffer                        q8_buffer,
+                                                  size_t                              q8_offset,
+                                                  size_t                              q8_binding_size,
+                                                  std::vector<webgpu_dispatch_desc> & dispatches) {
     ggml_webgpu_shader_lib_context shader_lib_ctx = {};
 
     shader_lib_ctx.src0               = src0;
     shader_lib_ctx.src1               = src1;
-    shader_lib_ctx.dst                = dst;
+    shader_lib_ctx.dst                = nullptr;
     shader_lib_ctx.max_wg_size        = ctx->global_ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup;
     shader_lib_ctx.supports_subgroups = ctx->global_ctx->capabilities.supports_subgroups;
 
     webgpu_pipeline qq8_pipeline = ctx->shader_lib->get_quantize_q8_pipeline(shader_lib_ctx);
 
-    // quantize_q8 pipeline
-    const size_t dst_offset           = ggml_webgpu_tensor_offset(dst);
-    const size_t q8_src1_align_offset = ROUNDUP_POW2(
-        dst_offset + ggml_nbytes(dst), ctx->global_ctx->capabilities.limits.minStorageBufferOffsetAlignment);
-    const size_t q8_src1_binding_size = ROUNDUP_POW2(
-        src1->ne[3] * src1->ne[2] * src1->ne[1] * (36 /* sizeof(q8_1) */ * (src1->ne[0] / /* block_size */ 32)),
-        WEBGPU_STORAGE_BUF_BINDING_MULT);
+    if (ggml_webgpu_q8_reuse_stats_enabled()) {
+        ctx->q8_stat_emitted += 1;
+    }
 
     std::vector<uint32_t> q8_params = {
         (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, src1) / ggml_type_size(src1->type)),
@@ -1663,7 +1788,7 @@ static void ggml_webgpu_quantize_q8_dispatch(webgpu_context &                   
 
     std::vector<wgpu::BindGroupEntry> q8_entries = {
         ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, src1),
-        ggml_webgpu_make_bind_group_entry(1, ggml_webgpu_tensor_buf(dst), q8_src1_align_offset, q8_src1_binding_size)
+        ggml_webgpu_make_bind_group_entry(1, q8_buffer, q8_offset, q8_binding_size)
     };
 
     auto q8_decisions = static_cast<ggml_webgpu_generic_shader_decisions *>(qq8_pipeline.context.get());
@@ -1679,6 +1804,20 @@ static void ggml_webgpu_quantize_q8_dispatch(webgpu_context &                   
     dispatches.push_back({
         qq8_pipeline, std::move(q8_params), std::move(q8_entries), { q8_wg_x, q8_wg_y }
     });
+}
+
+// Quantize src1 into the dst tail reserved by the matmul that consumes it.
+static void ggml_webgpu_quantize_q8_dispatch(webgpu_context &                    ctx,
+                                             ggml_tensor *                       src0,
+                                             ggml_tensor *                       src1,
+                                             ggml_tensor *                       dst,
+                                             std::vector<webgpu_dispatch_desc> & dispatches) {
+    const size_t dst_offset           = ggml_webgpu_tensor_offset(dst);
+    const size_t q8_src1_align_offset = ROUNDUP_POW2(
+        dst_offset + ggml_nbytes(dst), ctx->global_ctx->capabilities.limits.minStorageBufferOffsetAlignment);
+
+    ggml_webgpu_quantize_q8_dispatch_into(ctx, src0, src1, ggml_webgpu_tensor_buf(dst), q8_src1_align_offset,
+                                          ggml_webgpu_q8_copy_size(src1), dispatches);
 }
 
 static webgpu_encoded_op ggml_webgpu_mul_mat(webgpu_context & ctx,
@@ -1713,9 +1852,33 @@ static webgpu_encoded_op ggml_webgpu_mul_mat(webgpu_context & ctx,
     std::vector<webgpu_dispatch_desc> dispatches;
     const bool src_overlap = ggml_webgpu_tensor_binding_overlap(ctx->global_ctx, src0, src1) && !use_mmvq;
 
+    // One activation feeds several MMVQ matmuls (QKV, gate/up) that all read the same q8_1 layout
+    // when both operands are a plain 2-D batch, so the first consumer's copy can be shared.
+    const bool q8_shareable = use_mmvq && src0->ne[2] * src0->ne[3] == 1 && src1->ne[2] * src1->ne[3] == 1;
+
+    if (ggml_webgpu_q8_reuse_stats_enabled() && use_mmvq) {
+        ctx->q8_stat_mmvq += 1;
+        if (q8_shareable) {
+            ctx->q8_stat_cacheable += 1;
+            ctx->q8_stat_cacheable_k += (uint64_t) src1->ne[0];
+            if (ctx->q8_stat_distinct.insert(src1).second) {
+                ctx->q8_stat_distinct_k += (uint64_t) src1->ne[0];
+            }
+        }
+    }
+
+    webgpu_q8_region q8_region;
     if (use_mat_vec) {
         if (use_mmvq) {
-            ggml_webgpu_quantize_q8_dispatch(ctx, src0, src1, dst, dispatches);
+            if (q8_shareable) {
+                q8_region = ggml_webgpu_q8_cache_acquire(ctx, src1);
+                if (!q8_region.hit) {
+                    ggml_webgpu_quantize_q8_dispatch_into(ctx, src0, src1, q8_region.buffer, q8_region.offset,
+                                                          q8_region.size, dispatches);
+                }
+            } else {
+                ggml_webgpu_quantize_q8_dispatch(ctx, src0, src1, dst, dispatches);
+            }
         }
         pipeline = ctx->shader_lib->get_mul_mat_vec_pipeline(shader_lib_ctx, src_overlap);
     } else {
@@ -1757,9 +1920,14 @@ static webgpu_encoded_op ggml_webgpu_mul_mat(webgpu_context & ctx,
     std::vector<wgpu::BindGroupEntry> entries = {};
     if (use_mmvq) {
         entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, src0));
-        auto & mmvq_qq8_entry = dispatches[0].bind_group_entries[1];
-        entries.push_back(ggml_webgpu_make_bind_group_entry(1, ggml_webgpu_tensor_buf(dst), mmvq_qq8_entry.offset,
-                                                            mmvq_qq8_entry.size));
+        if (q8_region.hit) {
+            entries.push_back(
+                ggml_webgpu_make_bind_group_entry(1, q8_region.buffer, q8_region.offset, q8_region.size));
+        } else {
+            auto & mmvq_qq8_entry = dispatches[0].bind_group_entries[1];
+            entries.push_back(ggml_webgpu_make_bind_group_entry(1, mmvq_qq8_entry.buffer, mmvq_qq8_entry.offset,
+                                                                mmvq_qq8_entry.size));
+        }
         entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 2, dst));
     } else if (src_overlap) {
         entries.push_back(
@@ -3739,6 +3907,14 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
 #endif
 
     ctx->active_command_encoder = ctx->global_ctx->device.CreateCommandEncoder();
+    // the cached q8_1 copies are only valid inside this graph_compute
+    ggml_webgpu_q8_cache_clear(ctx);
+    ctx->q8_stat_mmvq        = 0;
+    ctx->q8_stat_cacheable   = 0;
+    ctx->q8_stat_emitted     = 0;
+    ctx->q8_stat_cacheable_k = 0;
+    ctx->q8_stat_distinct_k  = 0;
+    ctx->q8_stat_distinct.clear();
     if (ctx->batch_compute_passes) {
         ctx->active_compute_pass = ctx->active_command_encoder.BeginComputePass();
     }
@@ -3806,6 +3982,15 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
 
     if (contains_set_rows) {
         ggml_backend_webgpu_check_set_rows(ctx, num_inflight_batches);
+    }
+
+    if (ggml_webgpu_q8_reuse_stats_enabled()) {
+        GGML_LOG_INFO(
+            "[ggml_webgpu q8 reuse] graph: mmvq=%llu cacheable=%llu emitted=%llu distinct=%zu k_cacheable=%llu"
+            " k_distinct=%llu\n",
+            (unsigned long long) ctx->q8_stat_mmvq, (unsigned long long) ctx->q8_stat_cacheable,
+            (unsigned long long) ctx->q8_stat_emitted, ctx->q8_stat_distinct.size(),
+            (unsigned long long) ctx->q8_stat_cacheable_k, (unsigned long long) ctx->q8_stat_distinct_k);
     }
 
     WEBGPU_CPU_PROFILE_TOTAL_END(graph_compute, ctx->global_ctx);
