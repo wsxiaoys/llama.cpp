@@ -121,12 +121,18 @@ static void ggml_webgpu_create_buffer(wgpu::Device &    device,
 // Slot-based parameter arena for compute graph encoding. Each encoded kernel
 // gets a unique uniform-buffer slice within the current batch, and the slot
 // cursor is reset immediately after that batch is submitted.
+//
+// Params are staged in a host mirror of the arena (staging) and uploaded with a single
+// queue.WriteBuffer per submit batch instead of one write per dispatch: the slots a batch uses are
+// contiguous ([0, next_slot)) and every slot is written at its own slot_stride offset, so the
+// GPU-visible bytes are identical.
 struct webgpu_param_arena {
-    wgpu::Buffer buffer;
-    size_t       slot_stride = 0;
-    size_t       slot_size   = 0;
-    uint32_t     slot_count  = 0;
-    uint32_t     next_slot   = 0;
+    wgpu::Buffer         buffer;
+    std::vector<uint8_t> staging;  // host mirror of buffer; padding bytes stay zero
+    size_t               slot_stride = 0;
+    size_t               slot_size   = 0;
+    uint32_t             slot_count  = 0;
+    uint32_t             next_slot   = 0;
 
     void init(wgpu::Device device, size_t slot_size, uint32_t slot_count, size_t alignment) {
         this->slot_stride = ROUNDUP_POW2(slot_size, alignment);
@@ -134,6 +140,8 @@ struct webgpu_param_arena {
         this->slot_count  = slot_count;
         this->next_slot   = 0;
 
+        // zero once: slots are reused across batches and only the leading params bytes are written
+        staging.assign(this->slot_stride * slot_count, 0);
         ggml_webgpu_create_buffer(device, buffer, this->slot_stride * slot_count,
                                   wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::Uniform, "ggml_webgpu_param_arena");
     }
@@ -145,6 +153,19 @@ struct webgpu_param_arena {
         }
 
         return slot_stride * next_slot++;
+    }
+
+    void stage(size_t offset, const void * data, size_t size) {
+        GGML_ASSERT(offset + size <= staging.size());
+        memcpy(staging.data() + offset, data, size);
+    }
+
+    // Upload every slot the current batch used in one queue write; call before that batch is
+    // submitted. The staging size is the arena's fixed slot capacity, so this is bounded.
+    void flush(wgpu::Queue queue) {
+        if (next_slot > 0) {
+            queue.WriteBuffer(buffer, 0, staging.data(), slot_stride * next_slot);
+        }
     }
 
     void reset() { next_slot = 0; }
@@ -768,8 +789,8 @@ static webgpu_encoded_op ggml_backend_webgpu_build_multi(webgpu_context &       
     }
 
     for (size_t i = 0; i < param_offsets.size(); i++) {
-        ctx->global_ctx->queue.WriteBuffer(ctx->param_arena.buffer, param_offsets[i], dispatches[i].params.data(),
-                                           dispatches[i].params.size() * sizeof(uint32_t));
+        ctx->param_arena.stage(param_offsets[i], dispatches[i].params.data(),
+                               dispatches[i].params.size() * sizeof(uint32_t));
     }
 
 #ifdef GGML_WEBGPU_GPU_PROFILE
@@ -4633,7 +4654,8 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
             if (ctx->active_compute_pass) {
                 ctx->active_compute_pass.End();
             }
-            num_batched_kernels                = 0;
+            num_batched_kernels = 0;
+            ctx->param_arena.flush(ctx->global_ctx->queue);
             wgpu::CommandBuffer batch_commands = ctx->active_command_encoder.Finish();
             ggml_backend_webgpu_submit_commands(ctx, batch_commands, num_inflight_batches);
 
@@ -4666,6 +4688,7 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
     }
 
     if (num_batched_kernels > 0) {
+        ctx->param_arena.flush(ctx->global_ctx->queue);
         wgpu::CommandBuffer batch_commands = ctx->active_command_encoder.Finish();
         ggml_backend_webgpu_submit_commands(ctx, batch_commands, num_inflight_batches);
         ctx->param_arena.reset();
