@@ -100,6 +100,11 @@ static inline uint32_t ggml_webgpu_u32_from_f32(float value) {
 
 /* End Constants */
 
+// Bumped by every wgpu::Buffer create or destroy. The bind group memo keys on raw buffer handles,
+// so a (re)allocation can recycle a handle a memo entry was built from; the memo is dropped when
+// this changes.
+static std::atomic<uint64_t> g_webgpu_buffer_epoch{ 0 };
+
 // This is a "fake" base pointer, since WebGPU buffers do not have pointers to
 // their locations.
 static void * const webgpu_ptr_base = (void *) (uintptr_t) 0x1000;  // NOLINT
@@ -192,6 +197,44 @@ struct webgpu_dispatch_desc {
     std::vector<uint32_t>             params;
     std::vector<wgpu::BindGroupEntry> bind_group_entries;
     std::pair<uint32_t, uint32_t>     workgroups = { 1, 1 };
+};
+
+// Memo key for the bind group of one dispatch: the pipeline handle plus its ordered binding
+// entries. A pipeline's auto layout makes its identity imply the bind group layout, so this tuple
+// fully determines the CreateBindGroup result. Only the bind group object is memoized -- the
+// parameter bytes are still uploaded on every token through the stage/flush path, so a hit cannot
+// change a GPU-visible byte.
+struct webgpu_bind_group_key {
+    struct entry {
+        uint32_t     binding;
+        uint64_t     offset;
+        uint64_t     size;
+        const void * buffer;
+
+        bool operator==(const entry & other) const {
+            return binding == other.binding && offset == other.offset && size == other.size && buffer == other.buffer;
+        }
+    };
+
+    const void *       pipeline = nullptr;
+    std::vector<entry> entries;
+
+    bool operator==(const webgpu_bind_group_key & other) const {
+        return pipeline == other.pipeline && entries == other.entries;
+    }
+};
+
+struct webgpu_bind_group_key_hash {
+    size_t operator()(const webgpu_bind_group_key & key) const {
+        size_t h = std::hash<const void *>()(key.pipeline);
+        for (const webgpu_bind_group_key::entry & e : key.entries) {
+            h ^= std::hash<uint32_t>()(e.binding) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+            h ^= std::hash<uint64_t>()(e.offset) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+            h ^= std::hash<uint64_t>()(e.size) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+            h ^= std::hash<const void *>()(e.buffer) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        }
+        return h;
+    }
 };
 
 struct webgpu_capabilities {
@@ -323,6 +366,12 @@ struct webgpu_context_struct {
     wgpu::CommandEncoder     active_command_encoder;
     wgpu::ComputePassEncoder active_compute_pass;
     bool                     batch_compute_passes = true;
+
+    // Bind groups of replayed dispatches, keyed on the resolved descriptor. Dropped whenever a
+    // buffer is created or destroyed: the key holds raw buffer handles, which a (re)allocation can
+    // recycle.
+    std::unordered_map<webgpu_bind_group_key, wgpu::BindGroup, webgpu_bind_group_key_hash> bind_group_memo;
+    uint64_t                                                                               bind_group_memo_epoch = 0;
 
     // q8_1 copies of src1 shared by its MMVQ consumers; valid inside one graph_compute only
     wgpu::Buffer                                      q8_cache_buf;
@@ -469,6 +518,7 @@ static void ggml_webgpu_create_buffer(wgpu::Device &    device,
 
     // TODO: error handling
     buffer = device.CreateBuffer(&buffer_desc);
+    g_webgpu_buffer_epoch.fetch_add(1, std::memory_order_relaxed);
 }
 
 static wgpu::Buffer ggml_webgpu_tensor_buf(const ggml_tensor * tensor) {
@@ -769,6 +819,13 @@ static webgpu_encoded_op ggml_backend_webgpu_build_multi(webgpu_context &       
     std::vector<size_t>          param_offsets;
     result.num_kernels = dispatches.size();
 
+    // A (re)allocated buffer can recycle a handle a memo entry was built from; drop the memo then.
+    const uint64_t buffer_epoch = g_webgpu_buffer_epoch.load(std::memory_order_relaxed);
+    if (ctx->bind_group_memo_epoch != buffer_epoch) {
+        ctx->bind_group_memo.clear();
+        ctx->bind_group_memo_epoch = buffer_epoch;
+    }
+
     for (size_t i = 0; i < dispatches.size(); i++) {
         const webgpu_dispatch_desc & dispatch     = dispatches[i];
         const size_t                 param_size   = dispatch.params.size() * sizeof(uint32_t);
@@ -779,12 +836,27 @@ static webgpu_encoded_op ggml_backend_webgpu_build_multi(webgpu_context &       
         entries.push_back(ggml_webgpu_make_bind_group_entry(params_binding_num, ctx->param_arena.buffer, param_offset,
                                                             ctx->param_arena.slot_size));
 
-        wgpu::BindGroupDescriptor bind_group_desc;
-        bind_group_desc.layout     = dispatch.pipeline.pipeline.GetBindGroupLayout(0);
-        bind_group_desc.entryCount = entries.size();
-        bind_group_desc.entries    = entries.data();
-        bind_group_desc.label      = dispatch.pipeline.name.c_str();
-        bind_groups.push_back(ctx->global_ctx->device.CreateBindGroup(&bind_group_desc));
+        webgpu_bind_group_key key;
+        key.pipeline = dispatch.pipeline.pipeline.Get();
+        key.entries.reserve(entries.size());
+        for (const wgpu::BindGroupEntry & entry : entries) {
+            key.entries.push_back(
+                { entry.binding, entry.offset, entry.size, static_cast<const void *>(entry.buffer.Get()) });
+        }
+
+        const auto memo_it = ctx->bind_group_memo.find(key);
+        if (memo_it != ctx->bind_group_memo.end()) {
+            bind_groups.push_back(memo_it->second);
+        } else {
+            wgpu::BindGroupDescriptor bind_group_desc;
+            bind_group_desc.layout     = dispatch.pipeline.pipeline.GetBindGroupLayout(0);
+            bind_group_desc.entryCount = entries.size();
+            bind_group_desc.entries    = entries.data();
+            bind_group_desc.label      = dispatch.pipeline.name.c_str();
+            wgpu::BindGroup bind_group = ctx->global_ctx->device.CreateBindGroup(&bind_group_desc);
+            ctx->bind_group_memo.emplace(std::move(key), bind_group);
+            bind_groups.push_back(bind_group);
+        }
         param_offsets.push_back(param_offset);
     }
 
@@ -4848,6 +4920,7 @@ static void ggml_backend_webgpu_buffer_free_buffer(ggml_backend_buffer_t buffer)
     ggml_backend_webgpu_buffer_context * ctx = static_cast<ggml_backend_webgpu_buffer_context *>(buffer->context);
     if (ctx != nullptr && ctx->buffer != nullptr) {
         ctx->buffer.Destroy();
+        g_webgpu_buffer_epoch.fetch_add(1, std::memory_order_relaxed);
         delete ctx;
     }
 }
