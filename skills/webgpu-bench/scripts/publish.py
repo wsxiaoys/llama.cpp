@@ -8,7 +8,23 @@ import re
 import sys
 
 G_RE = re.compile(r"^G = ([0-9.]+)\s+G_pp = ([0-9.]+)\s+G_tg = ([0-9.]+)", re.M)
+CASE_IDS = ("a1", "a2", "a3", "a4", "a5", "a6", "g1")
 VALID = ("accepted", "needs-review")
+
+
+def case_medians(summary):
+    """{case id: (name, median ts)} from a record summary's case table."""
+    out = {}
+    for line in summary.splitlines():
+        if not line.startswith("| "):
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) >= 8 and parts[1] in CASE_IDS:
+            try:
+                out[parts[1]] = (parts[2], float(parts[6]))
+            except ValueError:
+                pass
+    return out
 
 
 def read_record(rec):
@@ -67,6 +83,20 @@ def main():
             r["meta"]["date"][:10], r["meta"]["commit"], r["meta"]["tag"],
             r["g"], r["g_pp"], r["g_tg"], delta))
         prev = (r["g"], r["meta"].get("case_set"))
+
+    first, last = records[0], records[-1]
+    base_cases = case_medians(first["summary"])
+    last_cases = case_medians(last["summary"])
+    if base_cases and last_cases and first["meta"].get("case_set") == last["meta"].get("case_set"):
+        lines += ["", "## base -> latest (per case)", "",
+                  "| id | case | base ts | latest ts | delta |", "|---|---|---|---|---|"]
+        for cid in CASE_IDS:
+            if cid in base_cases and cid in last_cases:
+                name, b = base_cases[cid]
+                _, l = last_cases[cid]
+                lines.append("| %s | %s | %.2f | %.2f | %+.1f%% |" % (cid, name, b, l, 100 * (l / b - 1)))
+        lines.append("| **G** | geomean over cases | %.2f | %.2f | %+.1f%% |" % (
+            first["g"], last["g"], 100 * (last["g"] / first["g"] - 1)))
 
     body = "\n".join(records[-1]["summary"].splitlines()[1:]).strip()
     lines += ["", "## latest", "", body, ""]
