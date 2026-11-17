@@ -1058,6 +1058,22 @@ struct ggml_webgpu_quantize_q8_pipeline_key_hash {
     }
 };
 
+struct ggml_webgpu_rms_norm_mul_quantize_pipeline_key {
+    uint32_t wg_size;
+
+    bool operator==(const ggml_webgpu_rms_norm_mul_quantize_pipeline_key & other) const {
+        return wg_size == other.wg_size;
+    }
+};
+
+struct ggml_webgpu_rms_norm_mul_quantize_pipeline_key_hash {
+    size_t operator()(const ggml_webgpu_rms_norm_mul_quantize_pipeline_key & key) const {
+        size_t seed = 0;
+        ggml_webgpu_hash_combine(seed, key.wg_size);
+        return seed;
+    }
+};
+
 struct ggml_webgpu_mul_mat_pipeline_key {
     ggml_type src0_type;
     ggml_type src1_type;
@@ -1400,6 +1416,10 @@ class ggml_webgpu_shader_lib {
                        webgpu_pipeline,
                        ggml_webgpu_rms_norm_mul_pipeline_key_hash>
         rms_norm_mul_pipelines;
+    std::unordered_map<ggml_webgpu_rms_norm_mul_quantize_pipeline_key,
+                       webgpu_pipeline,
+                       ggml_webgpu_rms_norm_mul_quantize_pipeline_key_hash>
+        rms_norm_mul_quantize_pipelines;
     std::unordered_map<ggml_webgpu_upscale_pipeline_key, webgpu_pipeline, ggml_webgpu_upscale_pipeline_key_hash>
         upscale_pipelines;
 
@@ -3004,6 +3024,30 @@ class ggml_webgpu_shader_lib {
         pipeline.context                = pipeline_decisions;
         rms_norm_mul_pipelines[key]     = pipeline;
         return rms_norm_mul_pipelines[key];
+    }
+
+    webgpu_pipeline get_rms_norm_mul_quantize_pipeline(const ggml_webgpu_shader_lib_context & context) {
+        ggml_webgpu_rms_norm_mul_quantize_pipeline_key key = {};
+        key.wg_size                                        = context.max_wg_size;
+
+        auto it = rms_norm_mul_quantize_pipelines.find(key);
+        if (it != rms_norm_mul_quantize_pipelines.end()) {
+            return it->second;
+        }
+
+        std::vector<std::string> defines;
+        std::string              variant = "rms_norm_mul_quantize";
+
+        defines.push_back("Q8_1_T");
+        defines.push_back(std::string("WG_SIZE=") + std::to_string(key.wg_size));
+
+        auto processed                       = preprocessor.preprocess(wgsl_rms_norm_mul_quantize, defines);
+        auto pipeline_decisions              = std::make_shared<ggml_webgpu_generic_shader_decisions>();
+        pipeline_decisions->wg_size          = key.wg_size;
+        webgpu_pipeline pipeline             = ggml_webgpu_create_pipeline(device, processed, variant);
+        pipeline.context                     = pipeline_decisions;
+        rms_norm_mul_quantize_pipelines[key] = pipeline;
+        return rms_norm_mul_quantize_pipelines[key];
     }
 
     webgpu_pipeline get_binary_pipeline(const ggml_webgpu_shader_lib_context & context, bool src_overlap) {
