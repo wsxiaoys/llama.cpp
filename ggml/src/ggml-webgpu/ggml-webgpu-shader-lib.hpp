@@ -51,6 +51,14 @@
 #define WEBGPU_MUL_MAT_SUBGROUP_TILE_K_FLOAT 32
 #define WEBGPU_MUL_MAT_SUBGROUP_TILE_K_QUANT 32
 
+// K split of the dense subgroup matrix path: the tile is fixed, so a grid below the device's
+// resident workgroup count leaves SMs idle. Splitting K adds workgroups at the same tile size.
+// TARGET_WGS is in workgroups: on the 4090 the K-loop shortens faster than the per-workgroup
+// overhead grows up to ~3 waves of 128 SMs, and beyond that the reduction traffic dominates.
+#define WEBGPU_MUL_MAT_SPLIT_K_MAX            4u
+#define WEBGPU_MUL_MAT_SPLIT_K_TARGET_WGS     384u
+#define WEBGPU_MUL_MAT_SPLIT_K_REDUCE_WG_SIZE 256u
+
 // Matrix-vector multiplication parameters
 #define WEBGPU_MUL_MAT_VEC_WG_SIZE 256
 
@@ -1053,10 +1061,12 @@ struct ggml_webgpu_mul_mat_pipeline_key {
     int       vectorized;
     int       use_subgroup_matrix;
     bool      src_overlap;
+    uint32_t  split_k;
 
     bool operator==(const ggml_webgpu_mul_mat_pipeline_key & other) const {
         return src0_type == other.src0_type && src1_type == other.src1_type && vectorized == other.vectorized &&
-               use_subgroup_matrix == other.use_subgroup_matrix && src_overlap == other.src_overlap;
+               use_subgroup_matrix == other.use_subgroup_matrix && src_overlap == other.src_overlap &&
+               split_k == other.split_k;
     }
 };
 
@@ -1068,6 +1078,7 @@ struct ggml_webgpu_mul_mat_pipeline_key_hash {
         ggml_webgpu_hash_combine(seed, key.vectorized);
         ggml_webgpu_hash_combine(seed, key.use_subgroup_matrix);
         ggml_webgpu_hash_combine(seed, key.src_overlap);
+        ggml_webgpu_hash_combine(seed, key.split_k);
         return seed;
     }
 };
@@ -1091,6 +1102,8 @@ struct ggml_webgpu_mul_mat_shader_decisions {
 
     uint32_t mul_mat_wg_size;
     bool     src_overlap = false;
+
+    uint32_t split_k = 1;
 };
 
 /** MUL_MAT_ID **/
@@ -1386,6 +1399,9 @@ class ggml_webgpu_shader_lib {
         rms_norm_mul_pipelines;
     std::unordered_map<ggml_webgpu_upscale_pipeline_key, webgpu_pipeline, ggml_webgpu_upscale_pipeline_key_hash>
         upscale_pipelines;
+
+    // split-K partial tile reduction of the dense subgroup matrix path
+    std::unordered_map<int, webgpu_pipeline> mul_mat_split_k_reduce_pipelines;
 
   public:
     ggml_webgpu_shader_lib(wgpu::Device device) { this->device = device; }
@@ -2343,7 +2359,9 @@ class ggml_webgpu_shader_lib {
         return mul_mat_vec_pipelines[key];
     }
 
-    webgpu_pipeline get_mul_mat_fast_pipeline(const ggml_webgpu_shader_lib_context & context, bool src_overlap) {
+    webgpu_pipeline get_mul_mat_fast_pipeline(const ggml_webgpu_shader_lib_context & context,
+                                              bool                                   src_overlap,
+                                              uint32_t                               split_k) {
         ggml_webgpu_mul_mat_pipeline_key key = {};
         key.src0_type                        = context.src0->type;
         key.src1_type                        = context.src1->type;
@@ -2353,6 +2371,8 @@ class ggml_webgpu_shader_lib {
                                       0;
         key.use_subgroup_matrix = context.supports_subgroup_matrix;
         key.src_overlap         = src_overlap;
+        // only the subgroup matrix path implements the K split
+        key.split_k             = key.use_subgroup_matrix ? split_k : 1u;
 
         auto it = mul_mat_fast_pipelines.find(key);
         if (it != mul_mat_fast_pipelines.end()) {
@@ -2463,6 +2483,9 @@ class ggml_webgpu_shader_lib {
         // Subgroup matrix specifics
         if (key.use_subgroup_matrix) {
             defines.push_back("TILE_K=" + std::to_string(tile_k) + "u");
+            if (key.split_k > 1) {
+                defines.push_back("SPLIT_K=" + std::to_string(key.split_k) + "u");
+            }
             defines.push_back("MAX_SUBGROUP_SIZE=" + std::to_string(context.max_subgroup_size) + "u");
             defines.push_back("SUBGROUP_M=" + std::to_string(WEBGPU_MUL_MAT_SUBGROUP_M) + "u");
             defines.push_back("SUBGROUP_N=" + std::to_string(WEBGPU_MUL_MAT_SUBGROUP_N) + "u");
@@ -2477,6 +2500,9 @@ class ggml_webgpu_shader_lib {
         variant += std::string("_") + (context.src1->type == GGML_TYPE_F32 ? "f32" : "f16");
         if (key.vectorized) {
             variant += "_vectorized";
+        }
+        if (key.use_subgroup_matrix && key.split_k > 1) {
+            variant += "_split" + std::to_string(key.split_k);
         }
 
         if (key.src_overlap) {
@@ -2497,6 +2523,7 @@ class ggml_webgpu_shader_lib {
         decisions->tile_m              = WEBGPU_MUL_MAT_TILE_M;
         decisions->tile_n              = WEBGPU_MUL_MAT_TILE_N;
         decisions->use_subgroup_matrix = key.use_subgroup_matrix;
+        decisions->split_k             = key.split_k;
         if (key.use_subgroup_matrix) {
             decisions->subgroup_m        = WEBGPU_MUL_MAT_SUBGROUP_M;
             decisions->subgroup_n        = WEBGPU_MUL_MAT_SUBGROUP_N;
@@ -2514,6 +2541,28 @@ class ggml_webgpu_shader_lib {
         pipeline.context            = decisions;
         mul_mat_fast_pipelines[key] = pipeline;
         return mul_mat_fast_pipelines[key];
+    }
+
+    // Sums the split-K partial tiles of the dense subgroup matrix path into dst. The partials are
+    // laid out like dst, one after the other, so this is a plain ordered sum.
+    webgpu_pipeline get_mul_mat_split_k_reduce_pipeline(const ggml_webgpu_shader_lib_context & context) {
+        auto it = mul_mat_split_k_reduce_pipelines.find(0);
+        if (it != mul_mat_split_k_reduce_pipelines.end()) {
+            return it->second;
+        }
+
+        const uint32_t wg_size = std::min(WEBGPU_MUL_MAT_SPLIT_K_REDUCE_WG_SIZE, context.max_wg_size);
+
+        std::vector<std::string> defines   = { "WG_SIZE=" + std::to_string(wg_size) + "u" };
+        auto                     processed = preprocessor.preprocess(wgsl_mul_mat_split_k_reduce, defines);
+
+        auto decisions     = std::make_shared<ggml_webgpu_generic_shader_decisions>();
+        decisions->wg_size = wg_size;
+
+        webgpu_pipeline pipeline            = ggml_webgpu_create_pipeline(device, processed, "mul_mat_split_k_reduce");
+        pipeline.context                    = decisions;
+        mul_mat_split_k_reduce_pipelines[0] = pipeline;
+        return mul_mat_split_k_reduce_pipelines.at(0);
     }
 
     webgpu_pipeline get_mul_mat_id_gather_pipeline(const ggml_webgpu_shader_lib_context & context,

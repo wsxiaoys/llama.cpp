@@ -15,6 +15,7 @@ enable chromium_experimental_subgroup_matrix;
 // TODO: this shader path does not work with some models like qwen2.5 on Metal devices, f16 accumulation causes NaNs.
 // See https://github.com/ggml-org/llama.cpp/issues/21602
 
+#ifndef SPLIT_K
 #ifdef VEC
 fn store_dst(shmem_idx: u32, dst_idx: u32) {
     dst[dst_idx] = vec4<f32>(
@@ -30,6 +31,26 @@ fn store_dst(shmem_idx: u32, dst_idx: u32) {
 fn store_dst(shmem_idx: u32, dst_idx: u32) {
     dst[dst_idx] = f32(shmem[shmem_idx]);
 }
+#endif
+#endif
+
+#ifdef SPLIT_K
+#ifdef VEC
+fn store_partial(shmem_idx: u32, idx: u32) {
+    partial[idx] = vec4<f32>(
+        f32(shmem[shmem_idx]),
+        f32(shmem[shmem_idx + 1]),
+        f32(shmem[shmem_idx + 2]),
+        f32(shmem[shmem_idx + 3])
+    );
+}
+#endif
+
+#ifdef SCALAR
+fn store_partial(shmem_idx: u32, idx: u32) {
+    partial[idx] = f32(shmem[shmem_idx]);
+}
+#endif
 #endif
 
 #ifdef MUL_MAT_ID
@@ -90,7 +111,13 @@ struct MulMatParams {
 #define DST_BINDING 2
 #endif
 
+// SPLIT_K writes a partial tile instead of dst; the two are never needed in the same dispatch, so
+// the partials reuse the dst binding slot.
+#ifdef SPLIT_K
+@group(0) @binding(DST_BINDING) var<storage, read_write> partial: array<DST_TYPE>; // split_k tiles of M rows, N columns
+#else
 @group(0) @binding(DST_BINDING) var<storage, read_write> dst: array<DST_TYPE>; // M rows, N columns (transposed)
+#endif
 @group(0) @binding(DST_BINDING + 1) var<uniform> params: MulMatParams;
 #endif
 
@@ -274,16 +301,29 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
     let wg_n_count = (params.n + WG_N_SG_TILE_SIZE - 1) / WG_N_SG_TILE_SIZE;
     let wg_per_matrix = wg_m_count * wg_n_count;
 
+    let total_batches = params.bs02 * params.broadcast2 * params.bs03 * params.broadcast3;
+
     let wg_linear = wg_id.y * num_wg.x + wg_id.x;
 
-    let batch_idx = wg_linear / wg_per_matrix;
+#ifdef SPLIT_K
+    // the split index is the slowest varying part of the linear id, so a split_k == 1 grid is unchanged
+    let split_stride = wg_per_matrix * total_batches;
+    let split_idx    = wg_linear / split_stride;
+    if (split_idx >= SPLIT_K) {
+        return;
+    }
+    let wg_in_split = wg_linear % split_stride;
+#else
+    let split_idx    = 0u;
+    let wg_in_split = wg_linear;
+#endif
 
-    let total_batches = params.bs02 * params.broadcast2 * params.bs03 * params.broadcast3;
+    let batch_idx = wg_in_split / wg_per_matrix;
     if (batch_idx >= total_batches) {
         return;
     }
 
-    let wg_in_batch = wg_linear % wg_per_matrix;
+    let wg_in_batch = wg_in_split % wg_per_matrix;
     let wg_m = wg_in_batch % wg_m_count;
     let wg_n = wg_in_batch / wg_m_count;
 
@@ -305,7 +345,18 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
 
     var acc_sg_mat : array<array<subgroup_matrix_result<f16, SUBGROUP_MATRIX_N_SIZE, SUBGROUP_MATRIX_M_SIZE>, SUBGROUP_MATRIX_N>, SUBGROUP_MATRIX_M>;
 
-    for (var k_outer = 0u; k_outer < params.k; k_outer += TILE_K) {
+#ifdef SPLIT_K
+    // each split covers a contiguous K range, rounded up to a whole number of k-tiles so every
+    // k_outer stays aligned to the quant block the shmem initializers index by
+    let k_per_split = ((params.k + SPLIT_K - 1u) / SPLIT_K + TILE_K - 1u) / TILE_K * TILE_K;
+    let k_start = split_idx * k_per_split;
+    let k_end   = min(params.k, k_start + k_per_split);
+#else
+    let k_start = 0u;
+    let k_end   = params.k;
+#endif
+
+    for (var k_outer = k_start; k_outer < k_end; k_outer += TILE_K) {
 
         // see mul_mat_decls.tmpl
         init_shmem_src0(thread_id, src0_batch_offset, offset_m, k_outer);
@@ -374,6 +425,13 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
     let tile_dst_row_base = wg_m * SUBGROUP_M * SUBGROUP_MATRIX_M * SUBGROUP_MATRIX_M_SIZE;
     let tile_dst_col_base = wg_n * SUBGROUP_N * SUBGROUP_MATRIX_N * SUBGROUP_MATRIX_N_SIZE;
 
+#ifdef SPLIT_K
+    let out_batch_offset =
+        split_idx * params.m * params.n * total_batches + dst3_idx * dst3_stride + dst2_idx * dst2_stride;
+#else
+    let out_batch_offset = dst_batch_offset;
+#endif
+
     for (var idx = thread_id * VEC_SIZE; idx < total_tile_elems; idx += TOTAL_WORKGROUP_SIZE * VEC_SIZE) {
         let local_row = idx % WG_TILE_STRIDE;
         let local_col = idx / WG_TILE_STRIDE;
@@ -382,8 +440,12 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
         let global_col = tile_dst_col_base + local_col;
 
         if (global_col < params.n && global_row < params.m) {
-            let dst_idx = dst_batch_offset + global_col * params.m + global_row;
-            store_dst(idx, dst_idx/VEC_SIZE);
+            let out_idx = out_batch_offset + global_col * params.m + global_row;
+#ifdef SPLIT_K
+            store_partial(idx, out_idx/VEC_SIZE);
+#else
+            store_dst(idx, out_idx/VEC_SIZE);
+#endif
         }
     }
 }
