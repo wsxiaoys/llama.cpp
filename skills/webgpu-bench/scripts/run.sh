@@ -220,10 +220,10 @@ while IFS=$'\t' read -r id model p n d _role; do
     echo "sched $id"
     if [[ $DRY -eq 1 ]]; then
         run env GGML_SCHED_DEBUG=2 "$BENCH_BIN" "${MARG[@]}" -p "$p" -n "$n" -d "$d" \
-            -ngl 99 -fa on -dev "$DEV" -r 1
+            -ngl 99 -fa on -dev "$DEV" -r 1 -v
     else
         GGML_SCHED_DEBUG=2 "$BENCH_BIN" "${MARG[@]}" -p "$p" -n "$n" -d "$d" \
-            -ngl 99 -fa on -dev "$DEV" -r 1 > /dev/null 2> "$OUT/e2e/sched-$id.log" || true
+            -ngl 99 -fa on -dev "$DEV" -r 1 -v > /dev/null 2> "$OUT/e2e/sched-$id.log" || true
     fi
 done < "$CASES"
 
@@ -303,7 +303,8 @@ if [[ $DO_PPL -eq 1 ]]; then
         mkdir -p "$ROOT/corpus"
         curl -L --fail -o "$ROOT/corpus/wikitext-2-raw-v1.zip" \
             https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip
-        unzip -o "$ROOT/corpus/wikitext-2-raw-v1.zip" -d "$ROOT/corpus"
+        # -j: the archive nests the .raw files under wikitext-2-raw/; flatten so $CORPUS exists
+        unzip -o -j "$ROOT/corpus/wikitext-2-raw-v1.zip" -d "$ROOT/corpus"
     fi
     if [[ -s "$CORPUS" ]]; then
         model_args "Qwen/Qwen2.5-3B-Instruct-GGUF:Q4_0"
