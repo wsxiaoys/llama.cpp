@@ -1,0 +1,10 @@
+# id	model	p	n	d	role
+# model: a path (starts with / or .) is passed to -m, anything else to -hf
+# case set v1 - changing this file starts a new chain
+a1	Qwen/Qwen3-0.6B-GGUF:Q8_0	512	0	0	smallest dense prefill
+a2	Qwen/Qwen3-0.6B-GGUF:Q8_0	0	128	0	smallest dense decode
+a3	Qwen/Qwen2.5-3B-Instruct-GGUF:Q4_0	512	0	0	mid dense prefill
+a4	Qwen/Qwen2.5-3B-Instruct-GGUF:Q4_0	0	128	0	mid dense decode
+a5	ggml-org/gpt-oss-20b-GGUF:MXFP4	512	0	0	MoE prefill
+a6	ggml-org/gpt-oss-20b-GGUF:MXFP4	0	128	0	MoE decode
+g1	Qwen/Qwen2.5-3B-Instruct-GGUF:Q4_0	0	128	4096	long-KV guard
