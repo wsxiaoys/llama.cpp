@@ -24,6 +24,9 @@ struct MulMatIdGatherParams {
 // per expert: the slot count, replaced by the first slot of the expert in ids_slot_pos by the prefix sum, then advanced as its write cursor
 var<workgroup> ids_count: array<atomic<u32>, N_EXPERT>;
 
+// slots owned by an expert; equals ids_slots_num when no slot is skipped
+var<workgroup> total_valid_slots: u32;
+
 // launched as a single workgroup, where the threads process the elements of ids in parallel with atomics
 @compute @workgroup_size(WG_SIZE)
 fn main(@builtin(local_invocation_id) local_id: vec3<u32>) {
@@ -70,6 +73,8 @@ fn main(@builtin(local_invocation_id) local_id: vec3<u32>) {
         }
 
         ids_tiles[0] = tile;
+
+        total_valid_slots = base;
     }
 
     workgroupBarrier();
@@ -86,6 +91,11 @@ fn main(@builtin(local_invocation_id) local_id: vec3<u32>) {
     }
 
     // the matmul writes only the rows that an expert owns, so zero the rows of the skipped slots
+    // common case: no slot is skipped, so the scan below is dead work
+    if (total_valid_slots == ids_slots_num) {
+        return;
+    }
+
     for (var i: u32 = 0; i < ids_slots_num; i += 1) {
         let row = i / params.n_expert_used;
         let col = i % params.n_expert_used;
