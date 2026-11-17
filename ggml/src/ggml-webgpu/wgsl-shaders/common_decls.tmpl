@@ -954,6 +954,25 @@ const kvalues_iq4nl = array<i32, 16>(
 const kvalues_mxfp4 = array<i32, 16>(
     0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12
 );
+
+// E2M1 nibble -> the kvalues_mxfp4 value as f32, without a dynamic table index.
+fn e2m1_to_f32(code: u32) -> f32 {
+#ifdef MXFP4_ARITH_DECODE
+    let e = (code >> 1u) & 3u;
+    let m = code & 1u;
+    // e == 0 is the subnormal case: 0 for m == 0, 1.0 (0x3C00) for m == 1
+    let mag = select(((e + 15u) << 10u) | (m << 9u), select(0u, 0x3C00u, m == 1u), e == 0u);
+    // the zero codes keep +0, so the sign bit never turns them into -0.0
+    let bits = select(mag | ((code & 8u) << 12u), mag, mag == 0u);
+    return f32(unpack2x16float(bits)[0]);
+#else
+    return f32(kvalues_mxfp4[code]);
+#endif
+}
+
+fn e2m1_to_i32(code: u32) -> i32 {
+    return i32(e2m1_to_f32(code));
+}
 #endif // MXFP4_LUT || NVFP4_LUT
 
 #ifdef NVFP4_LUT
