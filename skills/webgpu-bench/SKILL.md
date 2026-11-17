@@ -24,7 +24,7 @@ RECORD:      $WEBGPU_BENCH_ROOT/runs/<rig>/<YYYYMMDD>-<commit8>-<tag>/ ; accepte
 CASES:       summary.md (e2e: id, avg_ts per invocation, min/median/max, ref_ts) and
              ops/cases.md (op, params, us/run per invocation, min/median/max, noisy flag);
              aggregate = geomean avg_ts over the 7 e2e cases (G), reported with G_pp and G_tg;
-             ops aggregate = W_pp, W_tg (node-weighted geomean us/run)
+             ops aggregate = W (node-weighted geomean us/run)
 RUN:         scripts/run.sh <tag> ; 3 invocations x (7 cases x -r 5) ; profile subset = one
              invocation per case with the profile build ; wall time is recorded on the first
              baseline (budget 30-60 min per record) ; reuses the HF cache and the built binaries
@@ -173,10 +173,12 @@ The node count per op is the weight. The weighted aggregate is
 W = exp( sum_i w_i * ln(us_i) / sum_i w_i ),   w_i = nodes(op_i) / cases(op_i)
 ```
 
-so an op that runs 200 times per token counts more than one that runs twice. `W_pp` uses the
-prefill graphs (nodes per ubatch) and `W_tg` the decode graphs (nodes per token); they are not
-comparable with each other. `W_pp` and `W_tg` are diagnostics: they tell you where the e2e time goes
-and whether a kernel change moved it. They are not the keep gate.
+so an op that runs 200 times per graph counts more than one that runs twice. There is a single `W`:
+a ggml graph has the same op multiset for prefill and decode (only tensor sizes and the number of
+tokens per graph differ), so a node-count weight cannot separate pp from tg. Prefill vs decode is
+compared by `G_pp`/`G_tg` (Tier A) and by the shader-level GPU profile, which does name the prefill
+and decode kernel variants. `W` is a diagnostic - it tells you where the e2e time goes and whether a
+kernel change moved it - not the keep gate.
 
 Cases the backend does not support are printed as `not supported` and excluded. Record the count
 (`n_supported / n_total`) in `summary.md`; a change in that count between baseline and candidate is
@@ -205,14 +207,14 @@ $WEBGPU_BENCH_ROOT/
     e2e/<id>-<invocation>.json
     e2e/<id>-ref.json    optional VULKAN0 reference run
     e2e/sched-<id>.log   GGML_SCHED_DEBUG=2, one graph per log
-    e2e/load.log         first-eval "load time = ..." lines
+    e2e/load.log         e2e stderr; the "load time = ..." line (sched logs also carry it)
     e2e/rss.txt          /usr/bin/time -v for each invocation
     e2e/ppl.txt          perplexity output for the determinism gate
     ops/perf-{1,2,3}.sql
     ops/cases.md         generated: op, params, us/run per invocation, min/median/max, noisy
     ops/weights.json     case id -> {op: node count}
     profile/<case>/{raw,cpu,gpu,host,meta}.txt
-    summary.md           generated: case table, G, G_pp, G_tg, ranges, W_pp, W_tg
+    summary.md           generated: case table, G, G_pp, G_tg, ranges, W
   experiments/
     README.md            the queue table
     E00N-<slug>/README.md
@@ -239,6 +241,24 @@ skills/webgpu-bench/scripts/run.sh --tag base        # tag = base | E00N-<slug>
 `run.sh` writes `meta.json`, runs the invocations, derives the op set from the graph, runs the op
 tier, and leaves `status.json` as `draft`. A human (or the hill-climb parent) promotes it to
 `accepted` after the gates pass.
+
+### Record tiers
+
+A full record runs e2e + sched + ops + profile + ppl. Iterating on an experiment does not need all
+of it:
+
+```sh
+# experiment record: e2e + ppl only, no ops/profile/sched (~5 min)
+skills/webgpu-bench/scripts/run.sh --tag E00N-<slug> --fast
+
+# full record: baseline or accepted candidate; ops runs once
+skills/webgpu-bench/scripts/run.sh --tag base --fetch-corpus
+```
+
+The ops tier is the expensive part (~16 min per invocation for ~500 cases), so it defaults to
+`OPS_INVOCATIONS=1`, independent of `INVOCATIONS` (which stays 3 for the e2e noise). Narrow it
+further with `OPS_OPS='<op1,op2>'` (override the derived op list) or `OPS_PARAMS='<regex>'` (filter
+`test-backend-ops` cases by params). Run the seconds-long pre-check before spending any record.
 
 ### Offline models (`-DLLAMA_CURL=OFF`)
 

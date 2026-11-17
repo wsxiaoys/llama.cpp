@@ -101,7 +101,7 @@ G = <geomean t/s over a1..a6, g1>   G_pp = ...   G_tg = ...
 G range over invocations: [min, max]
 noise_agg = (max-min)/median
 
-ops: n_supported / n_total cases, W_pp = <us/run>, W_tg = <us/run>
+ops: n_supported / n_total cases, W = <us/run>
 ppl = <value> (corpus <sha8>)
 peak rss = <MiB>
 load time = <ms>
@@ -116,14 +116,15 @@ when they exist, otherwise `n/a`.
 ## `ops/cases.md`
 
 ```markdown
-| op | params | us run1 | us run2 | us run3 | median | noise | w_pp | w_tg | noisy |
-|---|---|---|---|---|---|---|---|---|---|
-| MUL_MAT | type=q4_0,m=4096,n=512,k=4096 | ... | ... | ... | ... | ... | 0.31 | 0.62 | no |
+| op | params | us run1 | us run2 | us run3 | median | noise | w | noisy |
+|---|---|---|---|---|---|---|---|---|
+| MUL_MAT | type=q4_0,m=4096,n=512,k=4096 | ... | ... | ... | ... | ... | 0.31 | no |
 ```
 
-`w_pp` and `w_tg` are the per-token node count from `ops/weights.json` (prefill ubatch and decode
-token respectively) divided by the number of cases for that op. `noisy` marks cases below 50 us or
-with `noise > 10%`; they are excluded from `W_pp` and `W_tg`.
+`w` is the per-graph node count from `ops/weights.json` divided by the number of cases for that op.
+It is the same for prefill and decode cases: the ggml op multiset depends only on the graph topology,
+not the token count. `noisy` marks cases below 50 us or with `noise > 10%`; they are excluded from
+`W`. `n_supported / n_total` counts distinct cases (deduplicated across invocations).
 
 ## Keep decision
 

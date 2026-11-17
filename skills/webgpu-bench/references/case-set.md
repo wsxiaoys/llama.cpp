@@ -58,11 +58,14 @@ The graph tells you which ops the models run; the perf set tells you how fast th
 model once per test with scheduler debug on and collect the node lines:
 
 ```sh
-GGML_SCHED_DEBUG=2 ./bin/llama-bench -m <model> -p 512 -n 0 -r 1 -ngl 99 -fa on -dev WebGPU \
+GGML_SCHED_DEBUG=2 ./bin/llama-bench -m <model> -p 512 -n 0 -r 1 -ngl 99 -fa on -dev WebGPU -v \
     2> e2e/sched-a1.log
-GGML_SCHED_DEBUG=2 ./bin/llama-bench -m <model> -p 0 -n 128 -r 1 -ngl 99 -fa on -dev WebGPU \
+GGML_SCHED_DEBUG=2 ./bin/llama-bench -m <model> -p 0 -n 128 -r 1 -ngl 99 -fa on -dev WebGPU -v \
     2> e2e/sched-a2.log
 ```
+
+`-v` is required: `GGML_SCHED_DEBUG` prints through the common logger, which drops DEBUG messages
+unless the verbosity threshold is raised.
 
 Each node line looks like:
 
@@ -79,8 +82,9 @@ sed -n '/## SPLIT #0/,$p' e2e/sched-a2.log |
 ```
 
 The union over all seven logs is the `-o` filter for `test-backend-ops perf`. The counts go into
-`ops/weights.json` as `{case id: {op: count}}`, one graph per log, so a `pp` case counts nodes per
-ubatch and a `tg` case counts nodes per token. `scripts/ops_filter.py` does this.
+`ops/weights.json` as `{case id: {op: count}}`, one graph per log. A graph's op multiset is the same
+for prefill and decode (only tensor sizes and the token count differ), so the weight is a per-graph
+node count; there is a single `W`. `scripts/ops_filter.py` does this.
 
 Two rules:
 

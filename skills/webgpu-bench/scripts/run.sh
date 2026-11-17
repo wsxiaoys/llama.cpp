@@ -8,6 +8,7 @@ usage: run.sh --tag <tag> [options]
 
   --tag <tag>        record tag: base | E00N-<slug>            (required)
   --rig <rig>        rig name, default linux-4090
+  --fast             experiment record: e2e + ppl only (no ops, no profile, no sched)
   --no-ops           skip the per-op tier
   --no-profile       skip the profile tier
   --no-ppl           skip the perplexity check
@@ -15,11 +16,13 @@ usage: run.sh --tag <tag> [options]
   --dry-run          print the commands, write nothing
 
 env: WEBGPU_BENCH_ROOT, BENCH_BIN, OPS_BIN, PPL_BIN, PROF_BIN, DEV, REPS, INVOCATIONS, MODELS_MAP
+     OPS_INVOCATIONS (default 1), OPS_OPS (override the derived -o list), OPS_PARAMS (extra -p regex)
 EOF
 }
 
 TAG=""
 RIG=""
+FAST=0
 DO_OPS=1
 DO_PROFILE=1
 DO_PPL=1
@@ -30,6 +33,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --tag)          TAG="$2"; shift 2 ;;
         --rig)          RIG="$2"; shift 2 ;;
+        --fast)         FAST=1; DO_OPS=0; DO_PROFILE=0; shift ;;
         --no-ops)       DO_OPS=0; shift ;;
         --no-profile)   DO_PROFILE=0; shift ;;
         --no-ppl)       DO_PPL=0; shift ;;
@@ -51,6 +55,9 @@ PROF_BIN=${PROF_BIN:-$REPO_ROOT/build-prof/bin/llama-bench}
 DEV=${DEV:-WebGPU}
 REPS=${REPS:-5}
 INVOCATIONS=${INVOCATIONS:-3}
+OPS_INVOCATIONS=${OPS_INVOCATIONS:-1}
+OPS_OPS=${OPS_OPS:-}
+OPS_PARAMS=${OPS_PARAMS:-}
 CASES=${CASES:-$REPO_ROOT/skills/webgpu-bench/scripts/cases.tsv}
 CORPUS=${PPL_CORPUS:-$ROOT/corpus/wiki.test.raw}
 MODELS_MAP=${MODELS_MAP:-$ROOT/models.tsv}
@@ -112,6 +119,17 @@ rss_wrap() {
     /usr/bin/time -v -o "$f" -a "$@"
 }
 
+# fetch the corpus before meta.json so its sha256 is recorded on the first run
+fetch_corpus() {
+    [[ -s "$CORPUS" ]] && return 0
+    [[ $FETCH_CORPUS -eq 1 ]] || return 0
+    mkdir -p "$ROOT/corpus"
+    curl -L --fail -o "$ROOT/corpus/wikitext-2-raw-v1.zip" \
+        https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip
+    # -j: the archive nests the .raw files under wikitext-2-raw/; flatten so $CORPUS exists
+    unzip -o -j "$ROOT/corpus/wikitext-2-raw-v1.zip" -d "$ROOT/corpus"
+}
+
 write_meta() {
     local gpu driver os dawn
     gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)
@@ -129,7 +147,7 @@ write_meta() {
 
     RIG_NAME=$RIG TAG_NAME=$TAG COMMIT=$COMMIT DIRTY=$DIRTY OS_NAME=$os GPU_NAME=$gpu \
     DRIVER=$driver DAWN=$dawn OUT_DIR=$OUT RIG_ROOT=$ROOT CASES_FILE=$CASES REPS=$REPS \
-    INVOCATIONS=$INVOCATIONS DEV_NAME=$DEV \
+    INVOCATIONS=$INVOCATIONS OPS_INVOCATIONS=$OPS_INVOCATIONS DEV_NAME=$DEV \
     BENCH_BIN=$BENCH_BIN PROF_BIN=$PROF_BIN CORPUS=$CORPUS \
     python3 - <<'PY'
 import json, os, subprocess, datetime
@@ -149,6 +167,7 @@ meta = {
     "device": os.environ["DEV_NAME"],
     "reps": int(os.environ["REPS"]),
     "invocations": int(os.environ["INVOCATIONS"]),
+    "ops_invocations": int(os.environ["OPS_INVOCATIONS"]),
     "builds": {
         "bench": os.environ["BENCH_BIN"],
         "profile": os.environ["PROF_BIN"],
@@ -192,6 +211,7 @@ PY
 }
 
 if [[ $DRY -eq 0 ]]; then
+    fetch_corpus
     write_meta
     printf '{"status": "draft", "note": "run.sh finished; gates not applied"}\n' > "$OUT/status.json"
 fi
@@ -213,7 +233,8 @@ while IFS=$'\t' read -r id model p n d _role; do
     done
 done < "$CASES"
 
-# graph shape and op weights
+# graph shape and op weights (only needed to derive the per-op tier)
+if [[ $DO_OPS -eq 1 ]]; then
 while IFS=$'\t' read -r id model p n d _role; do
     [[ -z "$id" || "$id" == \#* ]] && continue
     model_args "$model"
@@ -226,6 +247,7 @@ while IFS=$'\t' read -r id model p n d _role; do
             -ngl 99 -fa on -dev "$DEV" -r 1 -v > /dev/null 2> "$OUT/e2e/sched-$id.log" || true
     fi
 done < "$CASES"
+fi
 
 # backfill the resolved model path and hash now that the first run resolved it
 if [[ $DRY -eq 0 ]]; then
@@ -262,14 +284,21 @@ fi
 
 # tier B: per-op, restricted to the ops the models run
 if [[ $DO_OPS -eq 1 ]]; then
-    OPS=$(python3 "$REPO_ROOT/skills/webgpu-bench/scripts/ops_filter.py" "$OUT/e2e" "$OUT/ops/weights.json" || true)
+    if [[ -n "$OPS_OPS" ]]; then
+        OPS="$OPS_OPS"
+    else
+        OPS=$(python3 "$REPO_ROOT/skills/webgpu-bench/scripts/ops_filter.py" "$OUT/e2e" "$OUT/ops/weights.json" || true)
+    fi
     if [[ -n "$OPS" ]]; then
-        for i in $(seq 1 "$INVOCATIONS"); do
+        OPPARGS=()
+        [[ -n "$OPS_PARAMS" ]] && OPPARGS=(-p "$OPS_PARAMS")
+        for i in $(seq 1 "$OPS_INVOCATIONS"); do
             echo "ops run $i: $OPS"
             if [[ $DRY -eq 1 ]]; then
-                run "$OPS_BIN" perf -b "$DEV" --output sql -o "$OPS"
+                run "$OPS_BIN" perf -b "$DEV" --output sql -o "$OPS" "${OPPARGS[@]}"
             else
-                "$OPS_BIN" perf -b "$DEV" --output sql -o "$OPS" > "$OUT/ops/perf-$i.sql" 2> "$OUT/ops/perf-$i.log"
+                "$OPS_BIN" perf -b "$DEV" --output sql -o "$OPS" "${OPPARGS[@]}" \
+                    > "$OUT/ops/perf-$i.sql" 2> "$OUT/ops/perf-$i.log"
             fi
         done
     else
@@ -299,13 +328,6 @@ fi
 
 # determinism: perplexity on the dense mid model
 if [[ $DO_PPL -eq 1 ]]; then
-    if [[ ! -s "$CORPUS" && $FETCH_CORPUS -eq 1 ]]; then
-        mkdir -p "$ROOT/corpus"
-        curl -L --fail -o "$ROOT/corpus/wikitext-2-raw-v1.zip" \
-            https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip
-        # -j: the archive nests the .raw files under wikitext-2-raw/; flatten so $CORPUS exists
-        unzip -o -j "$ROOT/corpus/wikitext-2-raw-v1.zip" -d "$ROOT/corpus"
-    fi
     if [[ -s "$CORPUS" ]]; then
         model_args "Qwen/Qwen2.5-3B-Instruct-GGUF:Q4_0"
         echo "ppl"

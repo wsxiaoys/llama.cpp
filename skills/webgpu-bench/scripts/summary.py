@@ -59,7 +59,7 @@ def load_e2e(out, cases):
 
 
 def load_ops(out):
-    rows, total, supported = {}, 0, 0
+    rows, all_keys, supported_keys = {}, set(), set()
     for path in sorted(glob.glob(os.path.join(out, "ops", "perf-*.sql"))):
         with open(path, errors="replace") as f:
             for line in f:
@@ -68,13 +68,13 @@ def load_ops(out):
                 vals = re.findall(r"'([^']*)'", line)
                 if len(vals) < 16:
                     continue
-                total += 1
+                key = (vals[3], vals[4])
+                all_keys.add(key)
                 if vals[6] != "1":
                     continue
-                supported += 1
-                key = (vals[3], vals[4])
+                supported_keys.add(key)
                 rows.setdefault(key, []).append(float(vals[9]))
-    return rows, supported, total
+    return rows, len(supported_keys), len(all_keys)
 
 
 def load_weights(out):
@@ -86,7 +86,9 @@ def load_weights(out):
 
 
 def weighted(rows, weights, ids):
-    # weight of one case = per-token node count of its op, split over the op's cases
+    # weight of one case = per-graph node count of its op, split over the op's cases.
+    # the ggml op multiset is the same for prefill and decode graphs, so there is a
+    # single W; pp/tg differ in shapes and token counts, which G_pp/G_tg capture.
     nodes = {}
     for cid in ids:
         for op, count in weights.get(cid, {}).items():
@@ -135,13 +137,13 @@ def load_rss(out):
 
 
 def load_time(out):
-    path = os.path.join(out, "e2e", "load.log")
-    if not os.path.exists(path):
-        return None
+    # the model-load line is at INFO, suppressed unless -v; the sched pass runs with -v
     best = 0.0
-    with open(path, errors="replace") as f:
-        for m in re.finditer(r"load time =\s*([0-9.]+) ms", f.read()):
-            best = max(best, float(m.group(1)))
+    for pattern in ("e2e/load.log", "e2e/sched-*.log"):
+        for path in glob.glob(os.path.join(out, pattern)):
+            with open(path, errors="replace") as f:
+                for m in re.finditer(r"load time =\s*([0-9.]+) ms", f.read()):
+                    best = max(best, float(m.group(1)))
     return best or None
 
 
@@ -211,9 +213,10 @@ def main():
 
     ops, n_supported, n_total = load_ops(out)
     weights = load_weights(out)
+    all_ids = [c["id"] for c in cases]
     if ops:
-        lines.append("ops: %d / %d cases, W_pp = %.1f us, W_tg = %.1f us" % (
-            n_supported, n_total, weighted(ops, weights, pp_ids), weighted(ops, weights, tg_ids)))
+        lines.append("ops: %d / %d cases, W = %.1f us" % (
+            n_supported, n_total, weighted(ops, weights, all_ids)))
     else:
         lines.append("ops: none")
 
@@ -245,36 +248,31 @@ def main():
         f.write("\n".join(lines) + "\n")
 
     if ops:
-        write_ops(out, ops, weights, pp_ids, tg_ids)
+        write_ops(out, ops, weights, all_ids)
 
 
-def write_ops(out, ops, weights, pp_ids, tg_ids):
-    def nodes_for(ids):
-        nodes = {}
-        for cid in ids:
-            for op, count in weights.get(cid, {}).items():
-                nodes[op] = max(nodes.get(op, 0), count)
-        return nodes
-
-    nodes_pp, nodes_tg = nodes_for(pp_ids), nodes_for(tg_ids)
+def write_ops(out, ops, weights, ids):
+    nodes = {}
+    for cid in ids:
+        for op, count in weights.get(cid, {}).items():
+            nodes[op] = max(nodes.get(op, 0), count)
     per_case = {}
     for (op, _params) in ops:
         per_case[op] = per_case.get(op, 0) + 1
 
     n_inv = max(len(v) for v in ops.values())
     lines = ["| op | params | " + " | ".join("us run%d" % (i + 1) for i in range(n_inv)) +
-             " | median | noise | w_pp | w_tg | noisy |",
-             "|---|---|" + "---|" * n_inv + "---|---|---|---|---|"]
+             " | median | noise | w | noisy |",
+             "|---|---|" + "---|" * n_inv + "---|---|---|---|"]
     for (op, params), runs in sorted(ops.items(), key=lambda kv: -statistics.median(kv[1] or [0])):
         cells = ["%.1f" % v for v in runs]
         cells += [""] * (n_inv - len(cells))
         med = statistics.median(runs)
         s = spread(runs)
         noisy = med < NOISY_US or s > NOISY_PCT
-        w_pp = nodes_pp.get(op, 0) / per_case[op]
-        w_tg = nodes_tg.get(op, 0) / per_case[op]
-        lines.append("| %s | %s | %s | %.1f | %.1f%% | %.3f | %.3f | %s |" % (
-            op, params, " | ".join(cells), med, 100 * s, w_pp, w_tg, "yes" if noisy else "no"))
+        w = nodes.get(op, 0) / per_case[op]
+        lines.append("| %s | %s | %s | %.1f | %.1f%% | %.3f | %s |" % (
+            op, params, " | ".join(cells), med, 100 * s, w, "yes" if noisy else "no"))
     with open(os.path.join(out, "ops", "cases.md"), "w") as f:
         f.write("\n".join(lines) + "\n")
 
