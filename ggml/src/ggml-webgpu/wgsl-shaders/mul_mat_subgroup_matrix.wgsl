@@ -24,12 +24,29 @@ fn store_dst(shmem_idx: u32, dst_idx: u32) {
         f32(shmem[shmem_idx + 3])
     );
 }
+
+#ifdef ADD_RESIDUAL
+fn store_dst_add(shmem_idx: u32, dst_idx: u32, residual_idx: u32) {
+    dst[dst_idx] = vec4<f32>(
+        f32(shmem[shmem_idx]),
+        f32(shmem[shmem_idx + 1]),
+        f32(shmem[shmem_idx + 2]),
+        f32(shmem[shmem_idx + 3])
+    ) + residual[residual_idx];
+}
+#endif
 #endif
 
 #ifdef SCALAR
 fn store_dst(shmem_idx: u32, dst_idx: u32) {
     dst[dst_idx] = f32(shmem[shmem_idx]);
 }
+
+#ifdef ADD_RESIDUAL
+fn store_dst_add(shmem_idx: u32, dst_idx: u32, residual_idx: u32) {
+    dst[dst_idx] = f32(shmem[shmem_idx]) + residual[residual_idx];
+}
+#endif
 #endif
 
 #ifdef MUL_MAT_ID
@@ -77,7 +94,11 @@ struct MulMatParams {
     bs02: u32,
     bs03: u32,
     broadcast2: u32,
-    broadcast3: u32
+    broadcast3: u32,
+#ifdef ADD_RESIDUAL
+    offset_residual: u32,
+    stride_res: u32,
+#endif
 };
 
 // SRC0_TYPE and SRC1_TYPE are defined in mul_mat_decls, which is included
@@ -91,7 +112,13 @@ struct MulMatParams {
 #endif
 
 @group(0) @binding(DST_BINDING) var<storage, read_write> dst: array<DST_TYPE>; // M rows, N columns (transposed)
-@group(0) @binding(DST_BINDING + 1) var<uniform> params: MulMatParams;
+#ifdef ADD_RESIDUAL
+@group(0) @binding(DST_BINDING + 1) var<storage, read_write> residual: array<DST_TYPE>;
+#define PARAMS_BINDING (DST_BINDING + 2)
+#else
+#define PARAMS_BINDING (DST_BINDING + 1)
+#endif
+@group(0) @binding(PARAMS_BINDING) var<uniform> params: MulMatParams;
 #endif
 
 const WG_M_SG_TILE_SIZE = SUBGROUP_M * SUBGROUP_MATRIX_M * SUBGROUP_MATRIX_M_SIZE;
@@ -383,7 +410,13 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
 
         if (global_col < params.n && global_row < params.m) {
             let dst_idx = dst_batch_offset + global_col * params.m + global_row;
+#ifdef ADD_RESIDUAL
+            // stride_res is the destination row count for a same-shape residual and 0 for a broadcast bias
+            let residual_idx = params.offset_residual + global_col * params.stride_res + global_row;
+            store_dst_add(idx, dst_idx/VEC_SIZE, residual_idx/VEC_SIZE);
+#else
             store_dst(idx, dst_idx/VEC_SIZE);
+#endif
         }
     }
 }

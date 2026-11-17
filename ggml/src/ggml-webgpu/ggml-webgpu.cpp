@@ -282,6 +282,12 @@ static bool ggml_webgpu_fuse_glu_stats_enabled() {
     return enabled;
 }
 
+// E018 pre-check counters, see GGML_WEBGPU_FUSE_ADD_STATS in ggml_webgpu_encode.
+static bool ggml_webgpu_fuse_add_stats_enabled() {
+    static const bool enabled = std::getenv("GGML_WEBGPU_FUSE_ADD_STATS") != nullptr;
+    return enabled;
+}
+
 // All the base objects needed to run operations on a WebGPU device
 struct webgpu_context_struct {
     // Points to global instances owned by ggml_backend_webgpu_reg_context
@@ -319,6 +325,11 @@ struct webgpu_context_struct {
     uint64_t fg_stat_can_fuse      = 0;
     uint64_t fg_stat_sibling_match = 0;
     uint64_t fg_stat_matched       = 0;
+
+    uint64_t fa_stat_mul_mat = 0;
+    uint64_t fa_stat_pair    = 0;
+    uint64_t fa_stat_tiled   = 0;
+    uint64_t fa_stat_matched = 0;
 
 #ifdef GGML_WEBGPU_GPU_PROFILE
     // Profiling: per-shader GPU time in ms
@@ -1843,9 +1854,11 @@ static webgpu_encoded_op ggml_webgpu_mul_mat(webgpu_context & ctx,
     bool use_mmvq = ggml_webgpu_can_use_mmvq(
         src0, src1, src1->ne[1], ctx->global_ctx->capabilities.supports_dot_product, ctx->global_ctx->vendor);
 
-    // the fused epilogue is only wired into the MMVQ mat-vec path (see ggml_webgpu_can_fuse_mul_mat_add)
+    // the fused epilogue is wired into the MMVQ mat-vec path and the tiled subgroup-matrix path (see
+    // ggml_webgpu_can_fuse_mul_mat_add)
     const bool add_residual = residual != nullptr;
-    GGML_ASSERT(!add_residual || (use_mat_vec && use_mmvq));
+    GGML_ASSERT(!add_residual || (use_mat_vec && use_mmvq) ||
+                (!use_mat_vec && ctx->global_ctx->capabilities.supports_subgroup_matrix));
 
     ggml_webgpu_shader_lib_context shader_lib_ctx = {};
 
@@ -1898,7 +1911,7 @@ static webgpu_encoded_op ggml_webgpu_mul_mat(webgpu_context & ctx,
         }
         pipeline = ctx->shader_lib->get_mul_mat_vec_pipeline(shader_lib_ctx, src_overlap, false, add_residual);
     } else {
-        pipeline = ctx->shader_lib->get_mul_mat_fast_pipeline(shader_lib_ctx, src_overlap);
+        pipeline = ctx->shader_lib->get_mul_mat_fast_pipeline(shader_lib_ctx, src_overlap, add_residual);
     }
 
     uint32_t offset_src0   = (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, src0) / ggml_type_size(src0->type));
@@ -1916,23 +1929,16 @@ static webgpu_encoded_op ggml_webgpu_mul_mat(webgpu_context & ctx,
 
     // Build params
     std::vector<uint32_t> params = {
-        offset_src0,
-        offset_src1,
-        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, dst) / ggml_type_size(dst->type)),
-        (uint32_t) dst->ne[0],
-        (uint32_t) dst->ne[1],
-        (uint32_t) src0->ne[0],
-        (uint32_t) (src0->nb[1] / ggml_type_size(src0->type)),
-        (uint32_t) (src1->nb[1] / ggml_type_size(src1->type)),
-        (uint32_t) (src0->nb[2] / ggml_type_size(src0->type)),
-        (uint32_t) (src1->nb[2] / ggml_type_size(src1->type)),
-        (uint32_t) (src0->nb[3] / ggml_type_size(src0->type)),
-        (uint32_t) (src1->nb[3] / ggml_type_size(src1->type)),
-        (uint32_t) src0->ne[2],
-        (uint32_t) src0->ne[3],
-        (uint32_t) (src1->ne[2] / src0->ne[2]),
+        offset_src0, offset_src1, (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, dst) / ggml_type_size(dst->type)),
+        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) src0->ne[0],
+        (uint32_t) (src0->nb[1] / ggml_type_size(src0->type)), (uint32_t) (src1->nb[1] / ggml_type_size(src1->type)),
+        (uint32_t) (src0->nb[2] / ggml_type_size(src0->type)), (uint32_t) (src1->nb[2] / ggml_type_size(src1->type)),
+        (uint32_t) (src0->nb[3] / ggml_type_size(src0->type)), (uint32_t) (src1->nb[3] / ggml_type_size(src1->type)),
+        (uint32_t) src0->ne[2], (uint32_t) src0->ne[3], (uint32_t) (src1->ne[2] / src0->ne[2]),
         (uint32_t) (src1->ne[3] / src0->ne[3]),
-        (uint32_t) (add_residual ? ggml_webgpu_tensor_misalignment(ctx, residual) / ggml_type_size(residual->type) : 0)
+        (uint32_t) (add_residual ? ggml_webgpu_tensor_misalignment(ctx, residual) / ggml_type_size(residual->type) : 0),
+        // stride of the residual rows: the destination row count for a same-shape residual, 0 for a broadcast bias
+        (uint32_t) (add_residual && ggml_are_same_shape(residual, dst) ? dst->ne[0] : 0)
     };
 
     // Build bind group entries
@@ -1954,10 +1960,16 @@ static webgpu_encoded_op ggml_webgpu_mul_mat(webgpu_context & ctx,
         entries.push_back(
             ggml_webgpu_make_bind_group_entry(0, ggml_webgpu_tensor_buf(src0), merged_offset, merged_size));
         entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, dst));
+        if (add_residual) {
+            entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 2, residual));
+        }
     } else {
         entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, src0));
         entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, src1));
         entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 2, dst));
+        if (add_residual) {
+            entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 3, residual));
+        }
     }
 
     // Calculate workgroup dimensions
@@ -3788,7 +3800,8 @@ static bool ggml_webgpu_can_fuse_mul_mat_glu(const struct ggml_cgraph * cgraph, 
 }
 
 // Matches a single-use MUL_MAT followed by an ADD whose other operand is the residual (or bias) the
-// fused MMVQ epilogue can fold in, so the matmul output round trip and the ADD dispatch disappear.
+// matmul epilogue can fold in, so the matmul output round trip and the ADD dispatch disappear. The
+// decode MMVQ mat-vec epilogue and the tiled subgroup-matrix prefill epilogue both implement it.
 static bool ggml_webgpu_can_fuse_mul_mat_add(const struct ggml_cgraph * cgraph, int node_idx, webgpu_context & ctx) {
     if (!ggml_can_fuse(cgraph, node_idx, { GGML_OP_MUL_MAT, GGML_OP_ADD })) {
         return false;
@@ -3809,8 +3822,20 @@ static bool ggml_webgpu_can_fuse_mul_mat_add(const struct ggml_cgraph * cgraph, 
         return false;
     }
 
-    // the kernel reads the residual with the destination's linear layout: same shape, contiguous
-    if (!ggml_are_same_shape(residual, add) || !ggml_is_contiguous(residual) || !ggml_is_contiguous(add)) {
+    // the kernel reads the residual with the destination's linear layout: contiguous, and either the
+    // destination shape (residual add) or one row broadcast over the columns (bias add)
+    if (!ggml_is_contiguous(residual) || !ggml_is_contiguous(add)) {
+        return false;
+    }
+    const bool same_shape = ggml_are_same_shape(residual, add);
+    const bool bias       = residual->ne[1] == 1 && residual->ne[0] == add->ne[0];
+    if (!same_shape && !bias) {
+        return false;
+    }
+
+    // the epilogue indexes the residual with the destination's row/column offset, so both must be a
+    // single 2-D matrix
+    if (add->ne[2] * add->ne[3] != 1 || residual->ne[2] * residual->ne[3] != 1) {
         return false;
     }
 
@@ -3819,12 +3844,18 @@ static bool ggml_webgpu_can_fuse_mul_mat_add(const struct ggml_cgraph * cgraph, 
         return false;
     }
 
-    // decode MMVQ mat-vec path only
-    const bool          supports_dot_product = ctx->global_ctx->capabilities.supports_dot_product;
-    const std::string & vendor               = ctx->global_ctx->vendor;
-    if (add->ne[1] > GGML_WEBGPU_MUL_MAT_VEC_MAX_ROWS ||
-        !ggml_webgpu_can_use_mmvq(mat->src[0], mat->src[1], mat->src[1]->ne[1], supports_dot_product, vendor)) {
-        return false;
+    if (add->ne[1] <= GGML_WEBGPU_MUL_MAT_VEC_MAX_ROWS) {
+        // decode MMVQ mat-vec path only
+        const bool          supports_dot_product = ctx->global_ctx->capabilities.supports_dot_product;
+        const std::string & vendor               = ctx->global_ctx->vendor;
+        if (!ggml_webgpu_can_use_mmvq(mat->src[0], mat->src[1], mat->src[1]->ne[1], supports_dot_product, vendor)) {
+            return false;
+        }
+    } else {
+        // tiled prefill path; the epilogue is wired into the subgroup-matrix shader only
+        if (!ctx->global_ctx->capabilities.supports_subgroup_matrix) {
+            return false;
+        }
     }
 
     return true;
@@ -3972,6 +4003,19 @@ static std::optional<webgpu_encoded_op> ggml_webgpu_encode(webgpu_context ctx,
         }
         if (ggml_webgpu_can_fuse_mul_mat_glu(cgraph, node_idx, ctx)) {
             ctx->fg_stat_matched += 1;
+        }
+    }
+
+    if (ggml_webgpu_fuse_add_stats_enabled() && node->op == GGML_OP_MUL_MAT) {
+        ctx->fa_stat_mul_mat += 1;
+        if (ggml_can_fuse(cgraph, node_idx, { GGML_OP_MUL_MAT, GGML_OP_ADD })) {
+            ctx->fa_stat_pair += 1;
+            if (cgraph->nodes[node_idx + 1]->ne[1] > GGML_WEBGPU_MUL_MAT_VEC_MAX_ROWS) {
+                ctx->fa_stat_tiled += 1;
+            }
+        }
+        if (ggml_webgpu_can_fuse_mul_mat_add(cgraph, node_idx, ctx)) {
+            ctx->fa_stat_matched += 1;
         }
     }
 
@@ -4192,6 +4236,10 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
     ctx->fg_stat_can_fuse      = 0;
     ctx->fg_stat_sibling_match = 0;
     ctx->fg_stat_matched       = 0;
+    ctx->fa_stat_mul_mat       = 0;
+    ctx->fa_stat_pair          = 0;
+    ctx->fa_stat_tiled         = 0;
+    ctx->fa_stat_matched       = 0;
     if (ctx->batch_compute_passes) {
         ctx->active_compute_pass = ctx->active_command_encoder.BeginComputePass();
     }
@@ -4268,6 +4316,16 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
             GGML_LOG_INFO("[ggml_webgpu fuse glu] graph: mul_mat=%llu can_fuse=%llu sibling_match=%llu matched=%llu\n",
                           (unsigned long long) ctx->fg_stat_mul_mat, (unsigned long long) ctx->fg_stat_can_fuse,
                           (unsigned long long) ctx->fg_stat_sibling_match, (unsigned long long) ctx->fg_stat_matched);
+        }
+    }
+
+    if (ggml_webgpu_fuse_add_stats_enabled() && ctx->fa_stat_mul_mat > 0) {
+        static int fuse_add_stat_prints = 0;
+        if (fuse_add_stat_prints < 3) {
+            fuse_add_stat_prints += 1;
+            GGML_LOG_INFO("[ggml_webgpu fuse add] graph: mul_mat=%llu pair=%llu tiled=%llu matched=%llu\n",
+                          (unsigned long long) ctx->fa_stat_mul_mat, (unsigned long long) ctx->fa_stat_pair,
+                          (unsigned long long) ctx->fa_stat_tiled, (unsigned long long) ctx->fa_stat_matched);
         }
     }
 

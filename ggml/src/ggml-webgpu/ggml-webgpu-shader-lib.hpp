@@ -1053,10 +1053,12 @@ struct ggml_webgpu_mul_mat_pipeline_key {
     int       vectorized;
     int       use_subgroup_matrix;
     bool      src_overlap;
+    bool      add_residual;
 
     bool operator==(const ggml_webgpu_mul_mat_pipeline_key & other) const {
         return src0_type == other.src0_type && src1_type == other.src1_type && vectorized == other.vectorized &&
-               use_subgroup_matrix == other.use_subgroup_matrix && src_overlap == other.src_overlap;
+               use_subgroup_matrix == other.use_subgroup_matrix && src_overlap == other.src_overlap &&
+               add_residual == other.add_residual;
     }
 };
 
@@ -1068,6 +1070,7 @@ struct ggml_webgpu_mul_mat_pipeline_key_hash {
         ggml_webgpu_hash_combine(seed, key.vectorized);
         ggml_webgpu_hash_combine(seed, key.use_subgroup_matrix);
         ggml_webgpu_hash_combine(seed, key.src_overlap);
+        ggml_webgpu_hash_combine(seed, key.add_residual);
         return seed;
     }
 };
@@ -2343,7 +2346,10 @@ class ggml_webgpu_shader_lib {
         return mul_mat_vec_pipelines[key];
     }
 
-    webgpu_pipeline get_mul_mat_fast_pipeline(const ggml_webgpu_shader_lib_context & context, bool src_overlap) {
+    webgpu_pipeline get_mul_mat_fast_pipeline(const ggml_webgpu_shader_lib_context & context,
+                                              bool                                   src_overlap,
+                                              bool                                   add_residual) {
+        GGML_ASSERT(!add_residual || context.supports_subgroup_matrix);
         ggml_webgpu_mul_mat_pipeline_key key = {};
         key.src0_type                        = context.src0->type;
         key.src1_type                        = context.src1->type;
@@ -2353,6 +2359,7 @@ class ggml_webgpu_shader_lib {
                                       0;
         key.use_subgroup_matrix = context.supports_subgroup_matrix;
         key.src_overlap         = src_overlap;
+        key.add_residual        = add_residual;
 
         auto it = mul_mat_fast_pipelines.find(key);
         if (it != mul_mat_fast_pipelines.end()) {
@@ -2482,6 +2489,11 @@ class ggml_webgpu_shader_lib {
         if (key.src_overlap) {
             defines.push_back("SRC_OVERLAP");
             variant += "_src_overlap";
+        }
+
+        if (key.add_residual) {
+            defines.push_back("ADD_RESIDUAL");
+            variant += "_add_residual";
         }
 
         if (!key.use_subgroup_matrix) {
