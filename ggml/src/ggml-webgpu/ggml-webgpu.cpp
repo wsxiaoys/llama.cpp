@@ -1831,6 +1831,39 @@ static void ggml_webgpu_quantize_q8_dispatch(webgpu_context &                   
                                           ggml_webgpu_q8_copy_size(src1), dispatches);
 }
 
+// The dense subgroup matrix tile is fixed at SUBGROUP_M x SUBGROUP_N subgroup matrices, so a grid
+// below the device's resident workgroup count leaves SMs idle.
+static void ggml_webgpu_mul_mat_sg_tile(const webgpu_capabilities & caps, uint32_t & tile_m, uint32_t & tile_n) {
+    tile_m = WEBGPU_MUL_MAT_SUBGROUP_M * WEBGPU_MUL_MAT_SUBGROUP_MATRIX_M * caps.sg_mat_m;
+    tile_n = WEBGPU_MUL_MAT_SUBGROUP_N * WEBGPU_MUL_MAT_SUBGROUP_MATRIX_N * caps.sg_mat_n;
+}
+
+// Number of K splits for a dense subgroup matrix MUL_MAT: each split takes a contiguous K range of
+// the same tile, so the grid grows without changing the tile. Keep the largest split that still
+// fits WEBGPU_MUL_MAT_SPLIT_K_TARGET_WGS workgroups.
+static uint32_t ggml_webgpu_mul_mat_split_k(uint64_t grid) {
+    for (uint32_t split_k = WEBGPU_MUL_MAT_SPLIT_K_MAX; split_k >= 2; split_k >>= 1) {
+        if (grid * split_k <= WEBGPU_MUL_MAT_SPLIT_K_TARGET_WGS) {
+            return split_k;
+        }
+    }
+    return 1;
+}
+
+// With a K split the shader writes its partial tile into the dst tail, so the dst binding points at
+// that scratch region instead of dst.
+static wgpu::BindGroupEntry ggml_webgpu_mul_mat_dst_entry(webgpu_context & ctx,
+                                                          ggml_tensor *    dst,
+                                                          uint32_t         binding,
+                                                          uint32_t         split_k,
+                                                          size_t           partial_offset,
+                                                          size_t           partial_size) {
+    if (split_k > 1) {
+        return ggml_webgpu_make_bind_group_entry(binding, ggml_webgpu_tensor_buf(dst), partial_offset, partial_size);
+    }
+    return ggml_webgpu_make_tensor_bind_group_entry(ctx, binding, dst);
+}
+
 static webgpu_encoded_op ggml_webgpu_mul_mat(webgpu_context & ctx,
                                              ggml_tensor *    src0,
                                              ggml_tensor *    src1,
@@ -1846,6 +1879,31 @@ static webgpu_encoded_op ggml_webgpu_mul_mat(webgpu_context & ctx,
     // the fused epilogue is only wired into the MMVQ mat-vec path (see ggml_webgpu_can_fuse_mul_mat_add)
     const bool add_residual = residual != nullptr;
     GGML_ASSERT(!add_residual || (use_mat_vec && use_mmvq));
+
+    // Only the dense tiled subgroup matrix path splits K, see ggml_webgpu_mul_mat_split_k.
+    uint32_t split_k = 1;
+    if (!use_mat_vec && ctx->global_ctx->capabilities.supports_subgroup_matrix) {
+        uint32_t tile_m;
+        uint32_t tile_n;
+        ggml_webgpu_mul_mat_sg_tile(ctx->global_ctx->capabilities, tile_m, tile_n);
+        const uint64_t grid = CEIL_DIV((uint64_t) dst->ne[0], tile_m) * CEIL_DIV((uint64_t) dst->ne[1], tile_n) *
+                              (uint64_t) dst->ne[2] * (uint64_t) dst->ne[3];
+        split_k             = ggml_webgpu_mul_mat_split_k(grid);
+    }
+
+    // With a K split the shader writes its partial tile into the dst tail, which
+    // ggml_backend_webgpu_buffer_type_get_alloc_size reserves.
+    size_t   partial_offset = 0;
+    size_t   partial_size   = 0;
+    uint64_t dst_elems      = ggml_nelements(dst);
+    if (split_k > 1) {
+        GGML_ASSERT(dst_elems <= UINT32_MAX);
+        const size_t align_bytes = ctx->global_ctx->capabilities.limits.minStorageBufferOffsetAlignment;
+        partial_size   = ROUNDUP_POW2((size_t) split_k * dst_elems * sizeof(float), WEBGPU_STORAGE_BUF_BINDING_MULT);
+        // start after the dst binding so the two writable bindings cannot alias
+        partial_offset = ROUNDUP_POW2(
+            ggml_webgpu_tensor_align_offset(ctx, dst) + ggml_webgpu_tensor_binding_size(ctx, dst), align_bytes);
+    }
 
     ggml_webgpu_shader_lib_context shader_lib_ctx = {};
 
@@ -1898,7 +1956,7 @@ static webgpu_encoded_op ggml_webgpu_mul_mat(webgpu_context & ctx,
         }
         pipeline = ctx->shader_lib->get_mul_mat_vec_pipeline(shader_lib_ctx, src_overlap, false, add_residual);
     } else {
-        pipeline = ctx->shader_lib->get_mul_mat_fast_pipeline(shader_lib_ctx, src_overlap);
+        pipeline = ctx->shader_lib->get_mul_mat_fast_pipeline(shader_lib_ctx, src_overlap, split_k);
     }
 
     uint32_t offset_src0   = (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, src0) / ggml_type_size(src0->type));
@@ -1953,11 +2011,11 @@ static webgpu_encoded_op ggml_webgpu_mul_mat(webgpu_context & ctx,
     } else if (src_overlap) {
         entries.push_back(
             ggml_webgpu_make_bind_group_entry(0, ggml_webgpu_tensor_buf(src0), merged_offset, merged_size));
-        entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, dst));
+        entries.push_back(ggml_webgpu_mul_mat_dst_entry(ctx, dst, 1, split_k, partial_offset, partial_size));
     } else {
         entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, src0));
         entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, src1));
-        entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 2, dst));
+        entries.push_back(ggml_webgpu_mul_mat_dst_entry(ctx, dst, 2, split_k, partial_offset, partial_size));
     }
 
     // Calculate workgroup dimensions
@@ -1979,11 +2037,10 @@ static webgpu_encoded_op ggml_webgpu_mul_mat(webgpu_context & ctx,
         uint32_t wg_m;
         uint32_t wg_n;
         if (decisions->use_subgroup_matrix) {
-            uint32_t wg_m_sg_tile =
-                decisions->subgroup_m * decisions->subgroup_matrix_m * ctx->global_ctx->capabilities.sg_mat_m;
+            uint32_t wg_m_sg_tile;
+            uint32_t wg_n_sg_tile;
+            ggml_webgpu_mul_mat_sg_tile(ctx->global_ctx->capabilities, wg_m_sg_tile, wg_n_sg_tile);
             wg_m = CEIL_DIV(dst->ne[0], wg_m_sg_tile);
-            uint32_t wg_n_sg_tile =
-                decisions->subgroup_n * decisions->subgroup_matrix_n * ctx->global_ctx->capabilities.sg_mat_n;
             wg_n = CEIL_DIV(dst->ne[1], wg_n_sg_tile);
         } else {
             uint32_t tile_m_s = decisions->tile_m * decisions->wg_size_m;
@@ -1991,13 +2048,41 @@ static webgpu_encoded_op ggml_webgpu_mul_mat(webgpu_context & ctx,
             wg_m              = CEIL_DIV(dst->ne[0], tile_m_s);
             wg_n              = CEIL_DIV(dst->ne[1], tile_n_s);
         }
-        uint32_t total_wg = wg_m * wg_n * dst->ne[2] * dst->ne[3];
+        uint32_t total_wg = wg_m * wg_n * dst->ne[2] * dst->ne[3] * decisions->split_k;
         compute_2d_workgroups(total_wg, max_wg_per_dim, wg_x, wg_y);
     }
 
     dispatches.push_back({
         pipeline, std::move(params), std::move(entries), { wg_x, wg_y }
     });
+
+    if (split_k > 1) {
+        // Sum the split-K partial tiles into dst.
+        auto * decisions = static_cast<ggml_webgpu_mul_mat_shader_decisions *>(pipeline.context.get());
+        GGML_ASSERT(decisions->split_k == split_k);
+
+        webgpu_pipeline reduce_pipeline = ctx->shader_lib->get_mul_mat_split_k_reduce_pipeline(shader_lib_ctx);
+        auto * reduce_decisions = static_cast<ggml_webgpu_generic_shader_decisions *>(reduce_pipeline.context.get());
+
+        std::vector<uint32_t> reduce_params = {
+            (uint32_t) dst_elems,                                                                // ne
+            split_k,                                                                             // split_k
+            (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, dst) / ggml_type_size(dst->type)),  // offset_dst
+        };
+        std::vector<wgpu::BindGroupEntry> reduce_entries = {
+            ggml_webgpu_make_bind_group_entry(0, ggml_webgpu_tensor_buf(dst), partial_offset, partial_size),
+            ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, dst),
+        };
+
+        uint32_t reduce_wg_x = 1;
+        uint32_t reduce_wg_y = 1;
+        compute_2d_workgroups(CEIL_DIV((uint32_t) dst_elems, reduce_decisions->wg_size), max_wg_per_dim, reduce_wg_x,
+                              reduce_wg_y);
+
+        dispatches.push_back({
+            reduce_pipeline, std::move(reduce_params), std::move(reduce_entries), { reduce_wg_x, reduce_wg_y }
+        });
+    }
 
     return ggml_backend_webgpu_build_multi(ctx, dispatches);
 }
@@ -4911,6 +4996,26 @@ static size_t ggml_backend_webgpu_buffer_type_get_alloc_size(ggml_backend_buffer
                     res = ROUNDUP_POW2(res + q8_src1_size +
                                            ctx->webgpu_global_ctx->capabilities.limits.minStorageBufferOffsetAlignment,
                                        WEBGPU_STORAGE_BUF_BINDING_MULT);
+                }
+                // the split-K partial tiles of the tiled subgroup matrix path live in the dst tail
+                if (ctx->webgpu_global_ctx->capabilities.supports_subgroup_matrix &&
+                    tensor->ne[1] > GGML_WEBGPU_MUL_MAT_VEC_MAX_ROWS) {
+                    uint32_t tile_m;
+                    uint32_t tile_n;
+                    ggml_webgpu_mul_mat_sg_tile(ctx->webgpu_global_ctx->capabilities, tile_m, tile_n);
+                    const uint64_t grid    = CEIL_DIV((uint64_t) tensor->ne[0], tile_m) *
+                                             CEIL_DIV((uint64_t) tensor->ne[1], tile_n) * (uint64_t) tensor->ne[2] *
+                                             (uint64_t) tensor->ne[3];
+                    const uint32_t split_k = ggml_webgpu_mul_mat_split_k(grid);
+                    if (split_k > 1) {
+                        const size_t align =
+                            ctx->webgpu_global_ctx->capabilities.limits.minStorageBufferOffsetAlignment;
+                        const size_t partial_size =
+                            ROUNDUP_POW2((size_t) split_k * (size_t) ggml_nelements(tensor) * sizeof(float),
+                                         WEBGPU_STORAGE_BUF_BINDING_MULT);
+                        res += partial_size + align + WEBGPU_STORAGE_BUF_BINDING_MULT;
+                        res = ROUNDUP_POW2(res, WEBGPU_STORAGE_BUF_BINDING_MULT);
+                    }
                 }
             }
             break;
