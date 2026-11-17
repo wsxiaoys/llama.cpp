@@ -992,16 +992,19 @@ inline bool ggml_webgpu_flash_attn_can_use_subgroup_matrix_path(bool            
 /** Matrix Multiplication **/
 
 struct ggml_webgpu_mul_mat_vec_pipeline_key {
-    ggml_type src0_type;
-    ggml_type src1_type;
-    int       vectorized;
-    uint32_t  num_cols;
-    bool      use_mmvq;
-    bool      src_overlap;
+    ggml_type   src0_type;
+    ggml_type   src1_type;
+    int         vectorized;
+    uint32_t    num_cols;
+    bool        use_mmvq;
+    bool        src_overlap;
+    bool        fuse_glu;
+    ggml_glu_op glu_op;
 
     bool operator==(const ggml_webgpu_mul_mat_vec_pipeline_key & other) const {
         return src0_type == other.src0_type && src1_type == other.src1_type && vectorized == other.vectorized &&
-               num_cols == other.num_cols && use_mmvq == other.use_mmvq && src_overlap == other.src_overlap;
+               num_cols == other.num_cols && use_mmvq == other.use_mmvq && src_overlap == other.src_overlap &&
+               fuse_glu == other.fuse_glu && glu_op == other.glu_op;
     }
 };
 
@@ -1014,6 +1017,8 @@ struct ggml_webgpu_mul_mat_vec_pipeline_key_hash {
         ggml_webgpu_hash_combine(seed, key.num_cols);
         ggml_webgpu_hash_combine(seed, key.use_mmvq);
         ggml_webgpu_hash_combine(seed, key.src_overlap);
+        ggml_webgpu_hash_combine(seed, key.fuse_glu);
+        ggml_webgpu_hash_combine(seed, key.glu_op);
         return seed;
     }
 };
@@ -1220,6 +1225,28 @@ struct ggml_webgpu_soft_max_pipeline_key_hash {
 };
 
 /** MMVQ **/
+
+// The OP_* define that selects a variant in glu_op.tmpl, or nullptr for an unsupported op.
+inline const char * ggml_webgpu_glu_op_define(ggml_glu_op op) {
+    switch (op) {
+        case GGML_GLU_OP_REGLU:
+            return "OP_REGLU";
+        case GGML_GLU_OP_GEGLU:
+            return "OP_GEGLU";
+        case GGML_GLU_OP_SWIGLU:
+            return "OP_SWIGLU";
+        case GGML_GLU_OP_SWIGLU_OAI:
+            return "OP_SWIGLU_OAI";
+        case GGML_GLU_OP_GEGLU_ERF:
+            return "OP_GEGLU_ERF";
+        case GGML_GLU_OP_GEGLU_QUICK:
+            return "OP_GEGLU_QUICK";
+        case GGML_GLU_OP_SWIGLU_CLAMP:
+            return "OP_SWIGLU_CLAMP";
+        default:
+            return nullptr;
+    }
+}
 
 inline bool ggml_webgpu_can_use_mmvq(const ggml_tensor * src0,
                                      const ggml_tensor * src1,
@@ -2123,7 +2150,9 @@ class ggml_webgpu_shader_lib {
         return quantize_q8_pipelines[key];
     }
 
-    webgpu_pipeline get_mul_mat_vec_pipeline(const ggml_webgpu_shader_lib_context & context, bool src_overlap) {
+    webgpu_pipeline get_mul_mat_vec_pipeline(const ggml_webgpu_shader_lib_context & context,
+                                             bool                                   src_overlap,
+                                             bool                                   fuse_glu) {
         ggml_webgpu_mul_mat_vec_pipeline_key key = {};
         key.src0_type                            = context.src0->type;
         key.src1_type                            = context.src1->type;
@@ -2135,6 +2164,8 @@ class ggml_webgpu_shader_lib {
         key.use_mmvq    = ggml_webgpu_can_use_mmvq(context.src0, context.src1, context.src1->ne[1],
                                                    context.supports_dot_product, context.vendor);
         key.src_overlap = src_overlap;
+        key.fuse_glu    = fuse_glu;
+        key.glu_op      = fuse_glu ? ggml_get_glu_op(context.dst) : GGML_GLU_OP_SWIGLU;
 
         auto it = mul_mat_vec_pipelines.find(key);
         if (it != mul_mat_vec_pipelines.end()) {
@@ -2259,6 +2290,14 @@ class ggml_webgpu_shader_lib {
         if (key.use_mmvq) {
             defines.push_back("MMVQ");
             defines.push_back("Q8_1_T");
+        }
+
+        if (key.fuse_glu) {
+            const char * op_define = ggml_webgpu_glu_op_define(key.glu_op);
+            GGML_ASSERT(op_define != nullptr);
+            defines.push_back("FUSE_GLU");
+            defines.push_back(op_define);
+            variant += std::string("_fuse_") + op_define;
         }
 
         if (key.src_overlap) {

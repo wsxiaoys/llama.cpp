@@ -38,12 +38,24 @@ struct MulMatParams {
     bs03: u32,
     broadcast2: u32,
     broadcast3: u32
+#ifdef FUSE_GLU
+    , offset_src0_up: u32,
+    alpha: f32,
+    limit: f32,
+    pad0: u32
+#endif
 };
 
 #if defined(MMVQ)
 @group(0) @binding(0) var<storage, read_write> src0: array<SRC0_TYPE>;
+#ifdef FUSE_GLU
+@group(0) @binding(1) var<storage, read_write> src0_up: array<SRC0_TYPE>;
+@group(0) @binding(2) var<storage, read_write> src1q: array<q8_1>;
+#define DST_BINDING 3
+#else
 @group(0) @binding(1) var<storage, read_write> src1q: array<q8_1>;
 #define DST_BINDING 2
+#endif
 #elif defined(SRC_OVERLAP)
 @group(0) @binding(0) var<storage, read_write> merged_src: array<SRC0_TYPE>;
 #define DST_BINDING 1
@@ -57,8 +69,17 @@ struct MulMatParams {
 // "mul_mat_vec_acc.tmpl" requires params.k, params.m, params.stride_01
 @group(0) @binding(DST_BINDING + 1) var<uniform> params: MulMatParams;
 
+// The fused variant reduces both the gate and the up dot products before applying the GLU.
+#ifdef FUSE_GLU
+#define DataType f32
+#include "glu_op.tmpl"
+#endif
+
 // Flattened as [row][thread] to keep each row's reduction contiguous in memory.
 var<workgroup> partial_sums: array<f32, OUTPUTS_PER_WG * WG_SIZE>;
+#ifdef FUSE_GLU
+var<workgroup> partial_sums_up: array<f32, OUTPUTS_PER_WG * WG_SIZE>;
+#endif
 
 fn partial_index(row: u32, thread: u32) -> u32 {
     return row * WG_SIZE + thread;
@@ -98,11 +119,19 @@ fn main(
     let src12_idx = dst2_idx;
 
     let src0_batch_offset = params.offset_src0 + src03_idx * params.stride_03 + src02_idx * params.stride_02;
+#ifdef FUSE_GLU
+    let src0_up_batch_offset = params.offset_src0_up + src03_idx * params.stride_03 + src02_idx * params.stride_02;
+#endif
     let dst_idx_base = params.offset_dst + dst3_idx * dst3_stride + dst2_idx * dst2_stride + row_base;
 
 #ifdef MMVQ
     let src1q_idx_base = (src13_idx * params.bs02 * params.broadcast2 + src12_idx) * params.n * (params.k / 32u);
-    let acc = accumulate_vec_q_dot(thread_id, row_base, src0_batch_offset, src1q_idx_base);
+#ifdef FUSE_GLU
+    let acc_gate = accumulate_vec_q_dot(&src0, thread_id, row_base, src0_batch_offset, src1q_idx_base);
+    let acc_up   = accumulate_vec_q_dot(&src0_up, thread_id, row_base, src0_up_batch_offset, src1q_idx_base);
+#else
+    let acc = accumulate_vec_q_dot(&src0, thread_id, row_base, src0_batch_offset, src1q_idx_base);
+#endif
 #else
     let src1_idx_base = params.offset_src1 + src13_idx * params.stride_13 + src12_idx * params.stride_12;
     let acc = accumulate_vec_dot(thread_id, row_base, src0_batch_offset, src1_idx_base);
@@ -110,6 +139,65 @@ fn main(
 
     for (var col = 0u;col < NUM_COLS;col += 1) {
 
+#ifdef FUSE_GLU
+#ifdef USE_SUBGROUP_REDUCTION
+            for (var row = 0u; row < OUTPUTS_PER_WG; row++) {
+                let subgroup_gate = subgroupAdd(acc_gate[col][row]);
+                let subgroup_up   = subgroupAdd(acc_up[col][row]);
+                if (subgroup_invocation_id == 0u) {
+                    partial_sums[partial_index(row, subgroup_id)]    = subgroup_gate;
+                    partial_sums_up[partial_index(row, subgroup_id)] = subgroup_up;
+                }
+            }
+
+            workgroupBarrier();
+
+            for (var row = subgroup_id; (row < OUTPUTS_PER_WG) && (row_base + row < params.m); row += num_subgroups) {
+                var gate_acc = 0.0f;
+                var up_acc   = 0.0f;
+                for (var k = subgroup_invocation_id; k < num_subgroups; k += subgroup_size) {
+                    gate_acc += partial_sums[partial_index(row, k)];
+                    up_acc   += partial_sums_up[partial_index(row, k)];
+                }
+                let gate_total = subgroupAdd(gate_acc);
+                let up_total   = subgroupAdd(up_acc);
+                if (subgroup_invocation_id == 0) {
+                    dst[dst_idx_base + col * params.m + row] = glu_op(gate_total, up_total);
+                }
+            }
+#endif
+
+#ifdef USE_WORKGROUP_REDUCTION
+            for (var row = 0u; row < OUTPUTS_PER_WG; row++) {
+                partial_sums[partial_index(row, thread_id)]    = acc_gate[col][row];
+                partial_sums_up[partial_index(row, thread_id)] = acc_up[col][row];
+            }
+
+            workgroupBarrier();
+
+            var stride = WG_SIZE / 2u;
+
+            while (stride > 0) {
+                if (thread_id < stride) {
+                    for (var row = 0u; row < OUTPUTS_PER_WG; row++) {
+                        partial_sums[partial_index(row, thread_id)]    += partial_sums[partial_index(row, thread_id + stride)];
+                        partial_sums_up[partial_index(row, thread_id)] += partial_sums_up[partial_index(row, thread_id + stride)];
+                    }
+                }
+
+                workgroupBarrier();
+                stride = stride / 2u;
+            }
+
+            if (thread_id < OUTPUTS_PER_WG) {
+                let output_row = row_base + thread_id;
+                if (output_row < params.m) {
+                    dst[dst_idx_base + col * params.m + thread_id] =
+                        glu_op(partial_sums[partial_index(thread_id, 0)], partial_sums_up[partial_index(thread_id, 0)]);
+                }
+            }
+#endif
+#else
 #ifdef USE_SUBGROUP_REDUCTION
             for (var row = 0u; row < OUTPUTS_PER_WG; row++) {
                 let subgroup_total = subgroupAdd(acc[col][row]);
@@ -150,7 +238,7 @@ fn main(
                 }
 
                 workgroupBarrier();
-                stride = stride / 2;
+                stride = stride / 2u;
             }
 
             if (thread_id < OUTPUTS_PER_WG) {
@@ -159,6 +247,7 @@ fn main(
                     dst[dst_idx_base + col * params.m + thread_id] = partial_sums[partial_index(thread_id, 0)];
                 }
             }
+#endif
 #endif
 
     workgroupBarrier();

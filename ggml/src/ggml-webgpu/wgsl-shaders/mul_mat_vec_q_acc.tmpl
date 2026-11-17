@@ -14,6 +14,35 @@ fn sbyte_of(v: u32, b: u32) -> i32 {
 #define SRC0_TYPE SRC0_INNER_TYPE
 #define SRC1_TYPE SRC1_INNER_TYPE
 
+// Pointer-based byte loaders for the weights, so one accumulate can read either of the two weight
+// buffers bound to the fused MUL_MAT+MUL_MAT+GLU kernel. Byte-for-byte the same reads as the
+// load_*_at_src0 helpers in common_decls.tmpl, which stay bound to the global src0 array.
+#ifdef U32_DEQUANT_HELPERS
+fn q_load_u16_at(src0_arr: ptr<storage, array<u32>, read_write>, byte_offset: u32) -> u32 {
+    let word = (*src0_arr)[byte_offset / 4u];
+    let shift = (byte_offset & 0x2u) * 8u;
+    return (word >> shift) & 0xFFFFu;
+}
+
+fn q_load_u32_at_aligned(src0_arr: ptr<storage, array<u32>, read_write>, byte_offset: u32) -> u32 {
+    return (*src0_arr)[(byte_offset & ~3u) / 4u];
+}
+
+fn q_load_u32_at(src0_arr: ptr<storage, array<u32>, read_write>, byte_offset: u32) -> u32 {
+    let word_idx = byte_offset / 4u;
+    let shift = (byte_offset & 0x3u) * 8u;
+    let lo = (*src0_arr)[word_idx];
+    let hi = (*src0_arr)[word_idx + 1u];
+    let shifted = (lo >> shift) | (hi << (32u - shift));
+    return select(shifted, lo, shift == 0u);
+}
+
+fn q_load_f16_at(src0_arr: ptr<storage, array<u32>, read_write>, byte_offset: u32) -> f16 {
+    let packed = unpack2x16float(q_load_u16_at(src0_arr, byte_offset));
+    return f16(packed[0]);
+}
+#endif
+
 #ifdef LEGACY_QUANTS_HANDLING
 #define BLOCK_SIZE 32
 #define THREADS_PER_BLOCK 4
@@ -47,8 +76,8 @@ fn qh_bits(qh: u32, shift: u32) -> u32 {
 #ifdef MUL_ACC_Q4_0
 #define BLOCK_SIZE_BYTES 18
 #define B_DS_TYPE vec2<f32>
-fn repack_a(block_byte_base: u32, inner_id: u32) -> vec2<u32> {
-    let qs_packed = load_u32_at_src0(block_byte_base + 2u + 4u * inner_id);
+fn repack_a(src0_arr: ptr<storage, array<u32>, read_write>, block_byte_base: u32, inner_id: u32) -> vec2<u32> {
+    let qs_packed = q_load_u32_at(src0_arr, block_byte_base + 2u + 4u * inner_id);
 
     return vec2<u32>(
         qs_packed & 0x0F0F0F0Fu,
@@ -61,16 +90,16 @@ fn repack_b_dm(block: u32) -> B_DS_TYPE {
         f32(src1q[block].s)
     );
 }
-fn get_dm(block_byte_base: u32) -> f32 {
-    return f32(load_f16_at_src0(block_byte_base));
+fn get_dm(src0_arr: ptr<storage, array<u32>, read_write>, block_byte_base: u32) -> f32 {
+    return f32(q_load_f16_at(src0_arr, block_byte_base));
 }
 #endif // MUL_ACC_Q4_0
 
 #ifdef MUL_ACC_Q4_1
 #define BLOCK_SIZE_BYTES 20
 #define B_DS_TYPE vec2<f32>
-fn repack_a(block_byte_base: u32, inner_id: u32) -> vec2<u32> {
-    let qs_packed = load_u32_at_src0(block_byte_base + 4u + 4u * inner_id);
+fn repack_a(src0_arr: ptr<storage, array<u32>, read_write>, block_byte_base: u32, inner_id: u32) -> vec2<u32> {
+    let qs_packed = q_load_u32_at(src0_arr, block_byte_base + 4u + 4u * inner_id);
 
     return vec2<u32>(
         qs_packed & 0x0F0F0F0Fu,
@@ -83,10 +112,10 @@ fn repack_b_dm(block: u32) -> B_DS_TYPE {
         f32(src1q[block].s)
     );
 }
-fn get_dm(block_byte_base: u32) -> vec2<f32> {
+fn get_dm(src0_arr: ptr<storage, array<u32>, read_write>, block_byte_base: u32) -> vec2<f32> {
     return vec2<f32>(
-        f32(load_f16_at_src0(block_byte_base)),
-        f32(load_f16_at_src0(block_byte_base + 2u))
+        f32(q_load_f16_at(src0_arr, block_byte_base)),
+        f32(q_load_f16_at(src0_arr, block_byte_base + 2u))
     );
 }
 #endif // MUL_ACC_Q4_1
@@ -94,9 +123,9 @@ fn get_dm(block_byte_base: u32) -> vec2<f32> {
 #ifdef MUL_ACC_Q5_0
 #define BLOCK_SIZE_BYTES 22
 #define B_DS_TYPE vec2<f32>
-fn repack_a(block_byte_base: u32, inner_id: u32) -> vec2<u32> {
-    let qh        = load_u32_at_src0(block_byte_base + 2u);
-    let qs_packed = load_u32_at_src0(block_byte_base + 6u + 4u * inner_id);
+fn repack_a(src0_arr: ptr<storage, array<u32>, read_write>, block_byte_base: u32, inner_id: u32) -> vec2<u32> {
+    let qh        = q_load_u32_at(src0_arr, block_byte_base + 2u);
+    let qs_packed = q_load_u32_at(src0_arr, block_byte_base + 6u + 4u * inner_id);
 
     return vec2<u32>(
         (qs_packed & 0x0F0F0F0Fu) | qh_bits(qh, 4u * inner_id),
@@ -109,17 +138,17 @@ fn repack_b_dm(block: u32) -> B_DS_TYPE {
         f32(src1q[block].s)
     );
 }
-fn get_dm(block_byte_base: u32) -> f32 {
-    return f32(load_f16_at_src0(block_byte_base));
+fn get_dm(src0_arr: ptr<storage, array<u32>, read_write>, block_byte_base: u32) -> f32 {
+    return f32(q_load_f16_at(src0_arr, block_byte_base));
 }
 #endif // MUL_ACC_Q5_0
 
 #ifdef MUL_ACC_Q5_1
 #define BLOCK_SIZE_BYTES 24
 #define B_DS_TYPE vec2<f32>
-fn repack_a(block_byte_base: u32, inner_id: u32) -> vec2<u32> {
-    let qh        = load_u32_at_src0(block_byte_base + 4u);
-    let qs_packed = load_u32_at_src0(block_byte_base + 8u + 4u * inner_id);
+fn repack_a(src0_arr: ptr<storage, array<u32>, read_write>, block_byte_base: u32, inner_id: u32) -> vec2<u32> {
+    let qh        = q_load_u32_at(src0_arr, block_byte_base + 4u);
+    let qs_packed = q_load_u32_at(src0_arr, block_byte_base + 8u + 4u * inner_id);
 
     return vec2<u32>(
         (qs_packed & 0x0F0F0F0Fu) | qh_bits(qh, 4u * inner_id),
@@ -132,10 +161,10 @@ fn repack_b_dm(block: u32) -> B_DS_TYPE {
         f32(src1q[block].s)
     );
 }
-fn get_dm(block_byte_base: u32) -> vec2<f32> {
+fn get_dm(src0_arr: ptr<storage, array<u32>, read_write>, block_byte_base: u32) -> vec2<f32> {
     return vec2<f32>(
-        f32(load_f16_at_src0(block_byte_base)),
-        f32(load_f16_at_src0(block_byte_base + 2u))
+        f32(q_load_f16_at(src0_arr, block_byte_base)),
+        f32(q_load_f16_at(src0_arr, block_byte_base + 2u))
     );
 }
 #endif // MUL_ACC_Q5_1
@@ -143,8 +172,8 @@ fn get_dm(block_byte_base: u32) -> vec2<f32> {
 #ifdef MUL_ACC_MXFP4
 #define BLOCK_SIZE_BYTES 17
 #define B_DS_TYPE f32
-fn repack_a(block_byte_base: u32, inner_id: u32) -> vec2<u32> {
-    let qs_packed = load_u32_at_src0(block_byte_base + 1u + 4u * inner_id);
+fn repack_a(src0_arr: ptr<storage, array<u32>, read_write>, block_byte_base: u32, inner_id: u32) -> vec2<u32> {
+    let qs_packed = q_load_u32_at(src0_arr, block_byte_base + 1u + 4u * inner_id);
 
     var lo = 0u;
     var hi = 0u;
@@ -158,18 +187,18 @@ fn repack_a(block_byte_base: u32, inner_id: u32) -> vec2<u32> {
 fn repack_b_dm(block: u32) -> B_DS_TYPE {
     return B_DS_TYPE(src1q[block].d);
 }
-fn get_dm(block_byte_base: u32) -> f32 {
-    return ldexp(1.0, i32(byte_of(load_u32_at_src0(block_byte_base), 0u)) - 128);
+fn get_dm(src0_arr: ptr<storage, array<u32>, read_write>, block_byte_base: u32) -> f32 {
+    return ldexp(1.0, i32(byte_of(q_load_u32_at(src0_arr, block_byte_base), 0u)) - 128);
 }
 #endif // MUL_ACC_MXFP4
 
 #ifdef MUL_ACC_Q8_0
 #define BLOCK_SIZE_BYTES 34
 #define B_DS_TYPE f32
-fn repack_a(block_byte_base: u32, inner_id: u32) -> vec2<u32> {
+fn repack_a(src0_arr: ptr<storage, array<u32>, read_write>, block_byte_base: u32, inner_id: u32) -> vec2<u32> {
     return vec2<u32>(
-        load_u32_at_src0(block_byte_base + 2u + 4u * (inner_id * 2u)),
-        load_u32_at_src0(block_byte_base + 2u + 4u * (inner_id * 2u + 1))
+        q_load_u32_at(src0_arr, block_byte_base + 2u + 4u * (inner_id * 2u)),
+        q_load_u32_at(src0_arr, block_byte_base + 2u + 4u * (inner_id * 2u + 1))
     );
 }
 fn repack_b_qs(block:u32, inner_id: u32) -> vec2<u32> {
@@ -181,13 +210,13 @@ fn repack_b_qs(block:u32, inner_id: u32) -> vec2<u32> {
 fn repack_b_dm(block: u32) -> B_DS_TYPE {
     return B_DS_TYPE(src1q[block].d);
 }
-fn get_dm(block_byte_base: u32) -> f32 {
-    return f32(load_f16_at_src0(block_byte_base));
+fn get_dm(src0_arr: ptr<storage, array<u32>, read_write>, block_byte_base: u32) -> f32 {
+    return f32(q_load_f16_at(src0_arr, block_byte_base));
 }
 #endif // MUL_ACC_Q8_0
 
 #if defined(LEGACY_QUANTS_HANDLING)
-fn accumulate_vec_q_dot(thread_id: u32, row_base: u32, src0_batch_offset: u32, src1q_idx_base: u32) -> array<array<f32, OUTPUTS_PER_WG>, NUM_COLS> {
+fn accumulate_vec_q_dot(src0_arr: ptr<storage, array<u32>, read_write>, thread_id: u32, row_base: u32, src0_batch_offset: u32, src1q_idx_base: u32) -> array<array<f32, OUTPUTS_PER_WG>, NUM_COLS> {
     var acc: array<array<f32, OUTPUTS_PER_WG>, NUM_COLS>;
 
     let num_blocks = params.k / BLOCK_SIZE;
@@ -205,8 +234,8 @@ fn accumulate_vec_q_dot(thread_id: u32, row_base: u32, src0_batch_offset: u32, s
             let output_row = row_base + row;
             if (output_row < params.m) {
                 let block_byte_base = (src0_batch_offset + output_row * params.stride_01 + block) * BLOCK_SIZE_BYTES;
-                let a_repacked = repack_a(block_byte_base, inner_id);
-                let da = get_dm(block_byte_base);
+                let a_repacked = repack_a(src0_arr, block_byte_base, inner_id);
+                let da = get_dm(src0_arr, block_byte_base);
                 for (var col = 0u;col < NUM_COLS;col += 1) {
                     let b_repacked = b_qs_cols[col];
                     let b_ds = b_ds_cols[col];
@@ -260,8 +289,8 @@ fn sub_packed_bytes(v: u32, c: u32) -> u32 {
 #ifdef MUL_ACC_Q1_0
 #define BLOCK_SIZE_BYTES 18
 #define B_DS_TYPE f32
-fn repack_a(block_byte_base: u32, tid: u32) -> vec4<u32> {
-    let bits = load_u16_at_src0(block_byte_base + 2u + 2u * tid);
+fn repack_a(src0_arr: ptr<storage, array<u32>, read_write>, block_byte_base: u32, tid: u32) -> vec4<u32> {
+    let bits = q_load_u16_at(src0_arr, block_byte_base + 2u + 2u * tid);
 
     var res: vec4<u32>;
     for (var i = 0u; i < 4u; i++) {
@@ -274,39 +303,39 @@ fn repack_a(block_byte_base: u32, tid: u32) -> vec4<u32> {
 fn repack_b_dm(q8_block_idx: u32) -> B_DS_TYPE {
     return B_DS_TYPE(src1q[q8_block_idx].d);
 }
-fn get_dm(block_byte_base: u32) -> f32 {
-    return f32(load_f16_at_src0(block_byte_base));
+fn get_dm(src0_arr: ptr<storage, array<u32>, read_write>, block_byte_base: u32) -> f32 {
+    return f32(q_load_f16_at(src0_arr, block_byte_base));
 }
 #endif // MUL_ACC_Q1_0
 
 #ifdef MUL_ACC_Q2_K
 #define BLOCK_SIZE_BYTES 84
 #define B_DS_TYPE f32
-fn repack_a(block_byte_base: u32, tid: u32) -> vec4<u32> {
+fn repack_a(src0_arr: ptr<storage, array<u32>, read_write>, block_byte_base: u32, tid: u32) -> vec4<u32> {
     let ih2 = tid / 8u;
     let phase = tid % 2u;
     let iq4_idx = 2u * ih2 + phase;
     let qs_byte_base = block_byte_base + 16u + 16u * iq4_idx;
     let qs_shift = tid & 6u;
     return vec4<u32>(
-        (load_u32_at_src0_aligned(qs_byte_base) >> qs_shift) & 0x03030303u,
-        (load_u32_at_src0_aligned(qs_byte_base + 4u) >> qs_shift) & 0x03030303u,
-        (load_u32_at_src0_aligned(qs_byte_base + 8u) >> qs_shift) & 0x03030303u,
-        (load_u32_at_src0_aligned(qs_byte_base + 12u) >> qs_shift) & 0x03030303u,
+        (q_load_u32_at_aligned(src0_arr, qs_byte_base) >> qs_shift) & 0x03030303u,
+        (q_load_u32_at_aligned(src0_arr, qs_byte_base + 4u) >> qs_shift) & 0x03030303u,
+        (q_load_u32_at_aligned(src0_arr, qs_byte_base + 8u) >> qs_shift) & 0x03030303u,
+        (q_load_u32_at_aligned(src0_arr, qs_byte_base + 12u) >> qs_shift) & 0x03030303u,
     );
 }
 fn repack_b_dm(q8_block_idx: u32) -> B_DS_TYPE {
     return B_DS_TYPE(src1q[q8_block_idx].d);
 }
-fn get_dm(block_byte_base: u32) -> vec2<f32> {
+fn get_dm(src0_arr: ptr<storage, array<u32>, read_write>, block_byte_base: u32) -> vec2<f32> {
     return vec2<f32>(
-        f32(load_f16_at_src0(block_byte_base + 80u)),
-        f32(load_f16_at_src0(block_byte_base + 82u)),
+        f32(q_load_f16_at(src0_arr, block_byte_base + 80u)),
+        f32(q_load_f16_at(src0_arr, block_byte_base + 82u)),
     );
 }
-fn get_scale_min(block_byte_base: u32, tid: u32) -> vec2<f32> {
+fn get_scale_min(src0_arr: ptr<storage, array<u32>, read_write>, block_byte_base: u32, tid: u32) -> vec2<f32> {
     let scale_byte = block_byte_base + tid;
-    let scale = byte_of(load_u32_at_src0_aligned(scale_byte), scale_byte & 3u);
+    let scale = byte_of(q_load_u32_at_aligned(src0_arr, scale_byte), scale_byte & 3u);
     return vec2<f32>(f32(scale & 0xFu), f32(scale >> 4u));
 }
 #endif // MUL_ACC_Q2_K
@@ -314,7 +343,7 @@ fn get_scale_min(block_byte_base: u32, tid: u32) -> vec2<f32> {
 #ifdef MUL_ACC_Q3_K
 #define BLOCK_SIZE_BYTES 110
 #define B_DS_TYPE f32
-fn repack_a(block_byte_base: u32, tid: u32) -> vec4<u32> {
+fn repack_a(src0_arr: ptr<storage, array<u32>, read_write>, block_byte_base: u32, tid: u32) -> vec4<u32> {
     let half_blk = tid / 8u;
     let sub      = (tid % 8u) / 2u;
     let phase    = tid % 2u;
@@ -325,8 +354,8 @@ fn repack_a(block_byte_base: u32, tid: u32) -> vec4<u32> {
 
     var res: vec4<u32>;
     for (var i = 0u; i < 4u; i++) {
-        let qs = (load_u32_at_src0(qs_byte_base + 4u * i) >> qs_shift) & 0x03030303u;
-        let hm = (load_u32_at_src0(hm_byte_base + 4u * i) >> hm_shift) & 0x01010101u;
+        let qs = (q_load_u32_at(src0_arr, qs_byte_base + 4u * i) >> qs_shift) & 0x03030303u;
+        let hm = (q_load_u32_at(src0_arr, hm_byte_base + 4u * i) >> hm_shift) & 0x01010101u;
         // the high bit is stored inverted: a clear bit means the value is 4 lower
         res[i] = sub_packed_bytes(qs | (hm << 2u), 4u);
     }
@@ -335,15 +364,15 @@ fn repack_a(block_byte_base: u32, tid: u32) -> vec4<u32> {
 fn repack_b_dm(q8_block_idx: u32) -> B_DS_TYPE {
     return B_DS_TYPE(src1q[q8_block_idx].d);
 }
-fn get_dm(block_byte_base: u32) -> f32 {
-    return f32(load_f16_at_src0(block_byte_base + 108u));
+fn get_dm(src0_arr: ptr<storage, array<u32>, read_write>, block_byte_base: u32) -> f32 {
+    return f32(q_load_f16_at(src0_arr, block_byte_base + 108u));
 }
-fn get_scale_min(block_byte_base: u32, tid: u32) -> f32 {
+fn get_scale_min(src0_arr: ptr<storage, array<u32>, read_write>, block_byte_base: u32, tid: u32) -> f32 {
     let byte_idx = tid & 3u;
     let group    = tid / 4u;
 
-    let scales_lo = load_u32_at_src0(block_byte_base + 96u + 4u * (group & 1u));
-    let scales_hi = load_u32_at_src0(block_byte_base + 104u);
+    let scales_lo = q_load_u32_at(src0_arr, block_byte_base + 96u + 4u * (group & 1u));
+    let scales_hi = q_load_u32_at(src0_arr, block_byte_base + 104u);
 
     let lo_byte = byte_of(scales_lo, byte_idx);
     let lo      = select(lo_byte >> 4u, lo_byte & 0x0Fu, group < 2u);
@@ -362,18 +391,18 @@ fn repack_b_dm(q8_block_idx: u32) -> B_DS_TYPE {
         f32(src1q[q8_block_idx].s),
     );
 }
-fn get_dm(block_byte_base: u32) -> vec2<f32> {
+fn get_dm(src0_arr: ptr<storage, array<u32>, read_write>, block_byte_base: u32) -> vec2<f32> {
     return vec2<f32>(
-        f32(load_f16_at_src0(block_byte_base + 0u)),
-        f32(load_f16_at_src0(block_byte_base + 2u)),
+        f32(q_load_f16_at(src0_arr, block_byte_base + 0u)),
+        f32(q_load_f16_at(src0_arr, block_byte_base + 2u)),
     );
 }
-fn get_scale_min(block_byte_base: u32, tid: u32) -> vec2<f32> {
+fn get_scale_min(src0_arr: ptr<storage, array<u32>, read_write>, block_byte_base: u32, tid: u32) -> vec2<f32> {
     let sc_m_idx = tid / 2u;
     let scales_byte_base = block_byte_base + 4u;
-    let scales0_3  = load_u32_at_src0_aligned(scales_byte_base);
-    let scales4_7  = load_u32_at_src0_aligned(scales_byte_base + 4u);
-    let scales8_11 = load_u32_at_src0_aligned(scales_byte_base + 8u);
+    let scales0_3  = q_load_u32_at_aligned(src0_arr, scales_byte_base);
+    let scales4_7  = q_load_u32_at_aligned(src0_arr, scales_byte_base + 4u);
+    let scales8_11 = q_load_u32_at_aligned(src0_arr, scales_byte_base + 8u);
 
     let byte_idx = sc_m_idx & 3u;
     let is_high = sc_m_idx >= 4u;
@@ -392,24 +421,24 @@ fn get_scale_min(block_byte_base: u32, tid: u32) -> vec2<f32> {
 
 #ifdef MUL_ACC_Q4_K
 #define BLOCK_SIZE_BYTES 144
-fn repack_a(block_byte_base: u32, tid: u32) -> vec4<u32> {
+fn repack_a(src0_arr: ptr<storage, array<u32>, read_write>, block_byte_base: u32, tid: u32) -> vec4<u32> {
     let iq4 = tid / 4u;
     let phase = tid % 2u;
     let nibble = (tid >> 1u) % 2u;
     let q_qs_byte_base = block_byte_base + 16u + 32u * iq4 + 16u * phase;
     let qs_shift = 4u * nibble;
     return vec4<u32>(
-        (load_u32_at_src0_aligned(q_qs_byte_base) >> qs_shift) & 0x0F0F0F0Fu,
-        (load_u32_at_src0_aligned(q_qs_byte_base + 4u) >> qs_shift) & 0x0F0F0F0Fu,
-        (load_u32_at_src0_aligned(q_qs_byte_base + 8u) >> qs_shift) & 0x0F0F0F0Fu,
-        (load_u32_at_src0_aligned(q_qs_byte_base + 12u) >> qs_shift) & 0x0F0F0F0Fu,
+        (q_load_u32_at_aligned(src0_arr, q_qs_byte_base) >> qs_shift) & 0x0F0F0F0Fu,
+        (q_load_u32_at_aligned(src0_arr, q_qs_byte_base + 4u) >> qs_shift) & 0x0F0F0F0Fu,
+        (q_load_u32_at_aligned(src0_arr, q_qs_byte_base + 8u) >> qs_shift) & 0x0F0F0F0Fu,
+        (q_load_u32_at_aligned(src0_arr, q_qs_byte_base + 12u) >> qs_shift) & 0x0F0F0F0Fu,
     );
 }
 #endif // MUL_ACC_Q4_K
 
 #ifdef MUL_ACC_Q5_K
 #define BLOCK_SIZE_BYTES 176
-fn repack_a(block_byte_base: u32, tid: u32) -> vec4<u32> {
+fn repack_a(src0_arr: ptr<storage, array<u32>, read_write>, block_byte_base: u32, tid: u32) -> vec4<u32> {
     let iq4 = tid / 4u;
     let phase = tid % 2u;
     let nibble = (tid >> 1u) % 2u;
@@ -420,8 +449,8 @@ fn repack_a(block_byte_base: u32, tid: u32) -> vec4<u32> {
 
     var res: vec4<u32>;
     for (var i = 0u; i < 4u; i++) {
-        let ql = (load_u32_at_src0_aligned(ql_byte_base + 4u * i) >> ql_shift) & 0x0F0F0F0Fu;
-        let qh = (load_u32_at_src0_aligned(qh_byte_base + 4u * i) >> qh_shift) & 0x01010101u;
+        let ql = (q_load_u32_at_aligned(src0_arr, ql_byte_base + 4u * i) >> ql_shift) & 0x0F0F0F0Fu;
+        let qh = (q_load_u32_at_aligned(src0_arr, qh_byte_base + 4u * i) >> qh_shift) & 0x01010101u;
         res[i] = ql | (qh << 4u);
     }
     return res;
@@ -431,7 +460,7 @@ fn repack_a(block_byte_base: u32, tid: u32) -> vec4<u32> {
 #ifdef MUL_ACC_Q6_K
 #define BLOCK_SIZE_BYTES 210
 #define B_DS_TYPE f32
-fn repack_a(block_byte_base: u32, tid: u32) -> vec4<u32> {
+fn repack_a(src0_arr: ptr<storage, array<u32>, read_write>, block_byte_base: u32, tid: u32) -> vec4<u32> {
     let half_blk = tid / 8u;
     let sub      = (tid % 8u) / 2u;
     let phase    = tid % 2u;
@@ -442,8 +471,8 @@ fn repack_a(block_byte_base: u32, tid: u32) -> vec4<u32> {
 
     var res: vec4<u32>;
     for (var i = 0u; i < 4u; i++) {
-        let ql = (load_u32_at_src0(ql_byte_base + 4u * i) >> ql_shift) & 0x0F0F0F0Fu;
-        let qh = (load_u32_at_src0(qh_byte_base + 4u * i) >> qh_shift) & 0x03030303u;
+        let ql = (q_load_u32_at(src0_arr, ql_byte_base + 4u * i) >> ql_shift) & 0x0F0F0F0Fu;
+        let qh = (q_load_u32_at(src0_arr, qh_byte_base + 4u * i) >> qh_shift) & 0x03030303u;
         res[i] = sub_packed_bytes(ql | (qh << 4u), 32u);
     }
     return res;
@@ -451,17 +480,17 @@ fn repack_a(block_byte_base: u32, tid: u32) -> vec4<u32> {
 fn repack_b_dm(q8_block_idx: u32) -> B_DS_TYPE {
     return B_DS_TYPE(src1q[q8_block_idx].d);
 }
-fn get_dm(block_byte_base: u32) -> f32 {
-    return f32(load_f16_at_src0(block_byte_base + 208u));
+fn get_dm(src0_arr: ptr<storage, array<u32>, read_write>, block_byte_base: u32) -> f32 {
+    return f32(q_load_f16_at(src0_arr, block_byte_base + 208u));
 }
-fn get_scale_min(block_byte_base: u32, tid: u32) -> f32 {
+fn get_scale_min(src0_arr: ptr<storage, array<u32>, read_write>, block_byte_base: u32, tid: u32) -> f32 {
     let scale_byte = block_byte_base + 192u + tid;
-    return f32(sbyte_of(load_u32_at_src0_aligned(scale_byte), scale_byte & 3u));
+    return f32(sbyte_of(q_load_u32_at_aligned(src0_arr, scale_byte), scale_byte & 3u));
 }
 #endif // MUL_ACC_Q6_K
 
 #if defined(K_QUANTS_HANDLING)
-fn accumulate_vec_q_dot(thread_id: u32, row_base: u32, src0_batch_offset: u32, src1q_idx_base: u32) -> array<array<f32, OUTPUTS_PER_WG>, NUM_COLS> {
+fn accumulate_vec_q_dot(src0_arr: ptr<storage, array<u32>, read_write>, thread_id: u32, row_base: u32, src0_batch_offset: u32, src1q_idx_base: u32) -> array<array<f32, OUTPUTS_PER_WG>, NUM_COLS> {
     var acc: array<array<f32, OUTPUTS_PER_WG>, NUM_COLS>;
 
     let tid = thread_id % THREADS_PER_BLOCK;
@@ -478,10 +507,10 @@ fn accumulate_vec_q_dot(thread_id: u32, row_base: u32, src0_batch_offset: u32, s
             let output_row = row_base + row;
             if (output_row < params.m) {
                 let block_byte_base = (src0_batch_offset + output_row * params.stride_01 + block) * BLOCK_SIZE_BYTES;
-                let a_repacked = repack_a(block_byte_base, tid);
-                let dm = get_dm(block_byte_base);
+                let a_repacked = repack_a(src0_arr, block_byte_base, tid);
+                let dm = get_dm(src0_arr, block_byte_base);
 #ifndef MUL_ACC_Q1_0
-                let scale_min = get_scale_min(block_byte_base, tid);
+                let scale_min = get_scale_min(src0_arr, block_byte_base, tid);
 #endif
                 for (var col = 0u;col < NUM_COLS;col += 1) {
                     let b_repacked = b_qs_cols[col];
