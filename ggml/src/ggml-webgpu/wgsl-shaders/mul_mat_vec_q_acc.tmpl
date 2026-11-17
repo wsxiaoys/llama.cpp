@@ -179,8 +179,8 @@ fn repack_a(src0_arr: ptr<storage, array<u32>, read_write>, block_byte_base: u32
     var hi = 0u;
     for (var b = 0u; b < 4u; b++) {
         let q_byte = byte_of(qs_packed, b);
-        lo |= (bitcast<u32>(kvalues_mxfp4[q_byte & 0xFu]) & 0xFFu) << (8u * b);
-        hi |= (bitcast<u32>(kvalues_mxfp4[q_byte >> 4u]) & 0xFFu) << (8u * b);
+        lo |= (bitcast<u32>(e2m1_to_i32(q_byte & 0xFu)) & 0xFFu) << (8u * b);
+        hi |= (bitcast<u32>(e2m1_to_i32(q_byte >> 4u)) & 0xFFu) << (8u * b);
     }
     return vec2<u32>(lo, hi);
 }

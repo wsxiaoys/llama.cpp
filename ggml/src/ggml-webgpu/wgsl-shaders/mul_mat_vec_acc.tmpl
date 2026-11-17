@@ -1549,8 +1549,8 @@ fn accumulate_vec_dot(thread_id: u32, row_base: u32, src0_batch_offset: u32, src
                     var row_sum = 0.0;
                     for (var byte_idx = 0u; byte_idx < 4u; byte_idx++) {
                         let q_byte = get_byte(q_packed, byte_idx);
-                        let q_lo = f32(kvalues_mxfp4[q_byte & 0xFu]) * e;
-                        let q_hi = f32(kvalues_mxfp4[(q_byte >> 4u) & 0xFu]) * e;
+                        let q_lo = e2m1_to_f32(q_byte & 0xFu) * e;
+                        let q_hi = e2m1_to_f32((q_byte >> 4u) & 0xFu) * e;
                         row_sum += q_lo * x_block[col][byte_idx];
                         row_sum += q_hi * x_block[col][byte_idx + 4u];
                     }

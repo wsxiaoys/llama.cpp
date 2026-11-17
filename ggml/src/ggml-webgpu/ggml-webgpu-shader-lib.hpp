@@ -2256,6 +2256,7 @@ class ggml_webgpu_shader_lib {
                             break;
                         case GGML_TYPE_MXFP4:
                             defines.push_back(type_upper + "_LUT");
+                            defines.push_back("MXFP4_ARITH_DECODE");
                             if (key.use_mmvq) {
                                 defines.push_back("LEGACY_QUANTS_HANDLING");
                             }
@@ -2780,6 +2781,9 @@ class ggml_webgpu_shader_lib {
                             defines.push_back(type_upper + "_TABLES");
                             break;
                         case GGML_TYPE_MXFP4:
+                            defines.push_back(type_upper + "_LUT");
+                            defines.push_back("MXFP4_ARITH_DECODE");
+                            break;
                         case GGML_TYPE_NVFP4:
                             defines.push_back(type_upper + "_LUT");
                             break;
