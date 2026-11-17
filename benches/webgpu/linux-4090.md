@@ -26,6 +26,18 @@ Rig: NVIDIA GeForce RTX 4090, Linux 6.8.0-149-generic x86_64, driver 595.91.07, 
 | g1 | long-KV guard | 86.28 | 117.62 | +36.3% |
 | **G** | geomean over cases | 434.60 | 603.65 | +38.9% |
 
+## case set (models)
+
+| id | model | quant | params | role | sha256 |
+|---|---|---|---|---|---|
+| a1 | Qwen/Qwen3-0.6B-GGUF | Q8_0 | p512 | smallest dense prefill | 9465e63a22ad |
+| a2 | Qwen/Qwen3-0.6B-GGUF | Q8_0 | n128 | smallest dense decode | 9465e63a22ad |
+| a3 | Qwen/Qwen2.5-3B-Instruct-GGUF | Q4_0 | p512 | mid dense prefill | 670d82d0fbee |
+| a4 | Qwen/Qwen2.5-3B-Instruct-GGUF | Q4_0 | n128 | mid dense decode | 670d82d0fbee |
+| a5 | ggml-org/gpt-oss-20b-GGUF | MXFP4 | p512 | MoE prefill | 27cd6c432c76 |
+| a6 | ggml-org/gpt-oss-20b-GGUF | MXFP4 | n128 | MoE decode | 27cd6c432c76 |
+| g1 | Qwen/Qwen2.5-3B-Instruct-GGUF | Q4_0 | n128 d4096 | long-KV guard | 670d82d0fbee |
+
 ## latest
 
 commit 0544c3bd, case_set v1, dawn v20260908.214631 / 94c3c9c, driver 595.91.07, dirty: no
