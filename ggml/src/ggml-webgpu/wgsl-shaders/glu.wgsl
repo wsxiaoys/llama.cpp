@@ -7,70 +7,7 @@ enable f16;
 #define DataType f16
 #endif
 
-#ifdef OP_REGLU
-fn op(a: DataType, b: DataType) -> DataType {
-    return max(a, 0) * b;
-}
-#endif
-
-#ifdef OP_GEGLU
-const SQRT_2_OVER_PI: DataType =  0.79788456080286535587989211986876;
-const GELU_COEF_A: DataType = 0.044715;
-
-fn op(a: DataType, b: DataType) -> DataType {
-    let val = SQRT_2_OVER_PI * a * (1.0 + GELU_COEF_A * a * a);
-    return 0.5 * a * (2.0 - 2.0/ (exp(2* val) + 1)) * b;
-}
-#endif
-
-#ifdef OP_SWIGLU
-fn op(a: DataType, b: DataType) -> DataType {
-    return a / (1.0 + exp(-a)) * b;
-}
-#endif
-#ifdef OP_SWIGLU_OAI
-fn op(a: f32, b: f32) -> f32 {
-    let xi = min(a, params.limit);
-    let gi = max(min(b, params.limit), -params.limit);
-    var out_glu = xi / (1.0 + exp(-xi * params.alpha));
-    out_glu = out_glu * (1.0 + gi);
-    return out_glu;
-}
-#endif
-#ifdef OP_SWIGLU_CLAMP
-fn op(a: DataType, b: DataType) -> DataType {
-    let limit = DataType(params.limit);
-    let gate = min(a, limit);
-    let up = clamp(b, -limit, limit);
-    return gate / (1.0 + exp(-gate)) * up;
-}
-#endif
-#ifdef OP_GEGLU_ERF
-const p_erf: DataType = 0.3275911;
-const a1_erf: DataType = 0.254829592;
-const a2_erf: DataType = -0.284496736;
-const a3_erf: DataType = 1.421413741;
-const a4_erf: DataType = -1.453152027;
-const a5_erf: DataType = 1.061405429;
-const SQRT_2_INV: DataType = 0.7071067811865476;
-
-fn op(a: DataType, b: DataType) -> DataType {
-    let a_div_sqr2 = a * SQRT_2_INV;
-    let sign_x = sign(a_div_sqr2);
-    let x = abs(a_div_sqr2);
-    let t = 1.0 / (1.0 + p_erf * x);
-    let y = 1.0 - (((((a5_erf * t + a4_erf) * t + a3_erf) * t + a2_erf) * t + a1_erf) * t * exp(-x * x));
-    let erf_approx = sign_x * y;
-    return 0.5 * a * (1.0 + erf_approx) * b;
-}
-#endif
-#ifdef OP_GEGLU_QUICK
-const GELU_QUICK_COEF: DataType = -1.702;
-
-fn op(a: DataType, b: DataType) -> DataType {
-    return a * (1.0 / (1.0 + exp(GELU_QUICK_COEF * a))) * b;
-}
-#endif
+#include "glu_op.tmpl"
 
 struct Params {
     offset_src0: u32,
@@ -177,5 +114,5 @@ fn main(@builtin(num_workgroups) num_wg: vec3<u32>,
     let i_b = params.offset_src1 + i3 * params.stride_src13 + i2 * params.stride_src12 + i1 * params.stride_src11 + i0;
     let i_dst = params.offset_dst + i3 * params.stride_dst3 + i2 * params.stride_dst2 + i1 * params.stride_dst1 + i0;
 
-    dst[i_dst] = op(a_value(i_a), b_value(i_b));
+    dst[i_dst] = glu_op(a_value(i_a), b_value(i_b));
 }
