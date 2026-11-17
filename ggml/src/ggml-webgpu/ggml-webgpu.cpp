@@ -2450,7 +2450,9 @@ static uint32_t ggml_webgpu_flash_attn_vec_nwg(uint32_t vec_nwg_cap, uint32_t kv
     while ((2u * nwg * kv_span) < (uint64_t) seq_len_kv && nwg < vec_nwg_cap) {
         nwg <<= 1;
     }
-    return std::min(nwg, vec_nwg_cap);
+    // never spawn more splits than there are KV tiles to cover
+    const uint32_t nblk0 = (uint32_t) CEIL_DIV(seq_len_kv, kv_tile);
+    return std::min(nwg, std::min(vec_nwg_cap, nblk0));
 }
 
 static webgpu_encoded_op ggml_webgpu_flash_attn_direct(webgpu_context & ctx, const ggml_webgpu_flash_attn_op & op) {
@@ -2478,7 +2480,7 @@ static webgpu_encoded_op ggml_webgpu_flash_attn_vec(webgpu_context &          ct
     uint32_t     blk_nblk1       = 0;
     uint32_t     blk_batch_count = 0;
 
-    const uint32_t vec_nwg_cap = ctx->global_ctx->capabilities.min_subgroup_size;
+    const uint32_t vec_nwg_cap = GGML_WEBGPU_FLASH_ATTN_VEC_MAX_SPLITS;
     uint32_t       nwg         = ggml_webgpu_flash_attn_vec_nwg(vec_nwg_cap, decisions->kv_tile, (uint32_t) K->ne[1]);
     const uint64_t nrows       = (uint64_t) Q->ne[1] * Q->ne[2] * Q->ne[3];
     const bool     use_vec_reduce = nwg > 1u;
@@ -4863,7 +4865,7 @@ static size_t ggml_backend_webgpu_buffer_type_get_alloc_size(ggml_backend_buffer
                         ggml_webgpu_flash_attn_k_direct(Q, K, GGML_WEBGPU_FLASH_ATTN_TILE_KV_VEC_WIDTH),
                         ggml_webgpu_flash_attn_v_direct(Q, V, GGML_WEBGPU_FLASH_ATTN_TILE_KV_VEC_WIDTH));
 
-                    const uint32_t vec_nwg_cap = capabilities.min_subgroup_size;
+                    const uint32_t vec_nwg_cap = GGML_WEBGPU_FLASH_ATTN_VEC_MAX_SPLITS;
                     uint32_t       nwg = ggml_webgpu_flash_attn_vec_nwg(vec_nwg_cap, kv_tile, (uint32_t) K->ne[1]);
 
                     const size_t   align = capabilities.limits.minStorageBufferOffsetAlignment;
