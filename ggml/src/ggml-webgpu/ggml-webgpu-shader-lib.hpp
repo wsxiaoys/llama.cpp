@@ -21,6 +21,7 @@
 #define GGML_WEBGPU_FLASH_ATTN_VEC_MAX_SEQ_LEN       20u
 #define GGML_WEBGPU_MUL_MAT_VEC_MAX_ROWS             4
 #define GGML_WEBGPU_FLASH_ATTN_VEC_MAX_KV_TILE       32u
+#define GGML_WEBGPU_FLASH_ATTN_VEC_MAX_SPLITS        128u
 #define GGML_WEBGPU_FLASH_ATTN_TILE_MAX_KV_TILE      64u
 #define GGML_WEBGPU_FLASH_ATTN_PREFERRED_WG_SIZE     128u
 // Matches GGML_PAD(..., 256) in src/llama-context.cpp for KV cache sizing.
