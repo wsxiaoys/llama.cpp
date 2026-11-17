@@ -89,13 +89,14 @@ static inline uint32_t ggml_webgpu_u32_from_f32(float value) {
 
 /* Constants */
 
-#define WEBGPU_DEFAULT_COMMAND_SUBMIT_BATCH_SIZE 64u
-#define WEBGPU_NUM_PARAM_SLOT_SAFETY_MARGIN      10u
-#define WEBGPU_RUNTIME_WAIT_TIMEOUT_MS           30000u
-#define WEBGPU_RUNTIME_WAIT_TIMEOUT_NS           (WEBGPU_RUNTIME_WAIT_TIMEOUT_MS * 1e6)
-#define WEBGPU_PARAMS_BUF_SIZE_BYTES             256  // enough for 64 parameters
-#define WEBGPU_SET_ROWS_ERROR_BUF_SIZE_BYTES     4
-#define WEBGPU_STORAGE_BUF_BINDING_MULT          4    // a storage buffer binding size must be a multiple of 4
+#define WEBGPU_DEFAULT_COMMAND_SUBMIT_BATCH_SIZE  64u
+#define WEBGPU_NUM_PARAM_SLOT_SAFETY_MARGIN       10u
+#define WEBGPU_RUNTIME_WAIT_TIMEOUT_MS            30000u
+#define WEBGPU_RUNTIME_WAIT_TIMEOUT_NS            (WEBGPU_RUNTIME_WAIT_TIMEOUT_MS * 1e6)
+#define WEBGPU_PARAMS_BUF_SIZE_BYTES              256  // enough for 64 parameters
+#define WEBGPU_MOE_WEIGHTED_REDUCTION_MAX_EXPERTS 32
+#define WEBGPU_SET_ROWS_ERROR_BUF_SIZE_BYTES      4
+#define WEBGPU_STORAGE_BUF_BINDING_MULT           4  // a storage buffer binding size must be a multiple of 4
 
 /* End Constants */
 
@@ -2960,6 +2961,45 @@ static webgpu_encoded_op ggml_webgpu_add_id(webgpu_context & ctx,
     return ggml_backend_webgpu_build(ctx, pipeline, params, entries, wg_x, wg_y);
 }
 
+static webgpu_encoded_op ggml_webgpu_moe_weighted_reduction(webgpu_context & ctx,
+                                                            ggml_tensor *    experts,
+                                                            ggml_tensor *    weights,
+                                                            ggml_tensor *    dst) {
+    ggml_webgpu_shader_lib_context shader_lib_ctx = {};
+    shader_lib_ctx.src0                           = experts;
+    shader_lib_ctx.src1                           = weights;
+    shader_lib_ctx.dst                            = dst;
+    shader_lib_ctx.max_wg_size = ctx->global_ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup;
+
+    webgpu_pipeline pipeline = ctx->shader_lib->get_moe_weighted_reduction_pipeline(shader_lib_ctx);
+
+    const uint32_t        type_size = (uint32_t) ggml_type_size(GGML_TYPE_F32);
+    std::vector<uint32_t> params    = {
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, experts) / type_size),
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, weights) / type_size),
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, dst) / type_size),
+        (uint32_t) (experts->nb[1] / type_size),
+        (uint32_t) (experts->nb[2] / type_size),
+        (uint32_t) (weights->nb[1] / type_size),
+        (uint32_t) (weights->nb[2] / type_size),
+        (uint32_t) experts->ne[0],
+        (uint32_t) experts->ne[1],
+        (uint32_t) (experts->ne[2] * experts->ne[3]),
+    };
+
+    std::vector<wgpu::BindGroupEntry> entries = {
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, experts),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, weights),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 2, dst),
+    };
+
+    uint32_t wg_x;
+    uint32_t wg_y;
+    uint32_t total_wg = CEIL_DIV((uint32_t) ggml_nelements(dst), shader_lib_ctx.max_wg_size);
+    compute_2d_workgroups(total_wg, ctx->global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension, wg_x, wg_y);
+    return ggml_backend_webgpu_build(ctx, pipeline, params, entries, wg_x, wg_y);
+}
+
 static webgpu_encoded_op ggml_webgpu_concat(webgpu_context & ctx,
                                             ggml_tensor *    src0,
                                             ggml_tensor *    src1,
@@ -4058,6 +4098,125 @@ static bool ggml_webgpu_can_fuse_mul_mat_add(const struct ggml_cgraph * cgraph, 
     return true;
 }
 
+// Matches the build_moe_ffn expert aggregation: a MUL of the expert outputs by the router weights,
+// n_expert_used VIEWs of its expert rows and the n_expert_used-1 ADDs that sum them. The whole
+// reduction then becomes one kernel instead of 2*n_expert_used-1 dispatches.
+struct ggml_webgpu_moe_weighted_reduction_match {
+    ggml_tensor * experts    = nullptr;
+    ggml_tensor * weights    = nullptr;
+    ggml_tensor * dst        = nullptr;
+    int           node_count = 0;
+};
+
+static bool ggml_webgpu_can_fuse_moe_weighted_reduction(const struct ggml_cgraph *                 cgraph,
+                                                        int                                        node_idx,
+                                                        webgpu_context &                           ctx,
+                                                        ggml_webgpu_moe_weighted_reduction_match & match) {
+    const ggml_tensor * weighted = cgraph->nodes[node_idx];
+    if (weighted->op != GGML_OP_MUL || weighted->type != GGML_TYPE_F32 || !ggml_is_contiguous(weighted)) {
+        return false;
+    }
+
+    // the MUL is experts * router weights; the weights broadcast over the expert dimension
+    auto is_experts = [weighted](const ggml_tensor * t) {
+        return t != nullptr && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_are_same_shape(t, weighted);
+    };
+    auto is_weights = [weighted](const ggml_tensor * t) {
+        return t != nullptr && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && t->ne[0] == 1 &&
+               t->ne[1] == weighted->ne[1] && t->ne[2] == weighted->ne[2] && t->ne[3] == weighted->ne[3];
+    };
+
+    ggml_tensor * experts = nullptr;
+    ggml_tensor * weights = nullptr;
+    if (is_experts(weighted->src[0]) && is_weights(weighted->src[1])) {
+        experts = weighted->src[0];
+        weights = weighted->src[1];
+    } else if (is_experts(weighted->src[1]) && is_weights(weighted->src[0])) {
+        experts = weighted->src[1];
+        weights = weighted->src[0];
+    } else {
+        return false;
+    }
+
+    const int     n_expert_used = (int) weighted->ne[1];
+    const int64_t n_tokens      = weighted->ne[2] * weighted->ne[3];
+    if (n_expert_used < 2 || n_expert_used > WEBGPU_MOE_WEIGHTED_REDUCTION_MAX_EXPERTS) {
+        return false;
+    }
+
+    // 1 MUL + n_expert_used VIEWs + n_expert_used-1 ADDs
+    const int node_count = 2 * n_expert_used;
+    if (node_idx + node_count > cgraph->n_nodes) {
+        return false;
+    }
+
+    std::vector<int>          node_idxs(node_count);
+    std::vector<enum ggml_op> ops(node_count, GGML_OP_VIEW);
+    for (int i = 0; i < node_count; ++i) {
+        node_idxs[i] = node_idx + i;
+    }
+    ops[0] = GGML_OP_MUL;
+
+    std::vector<const ggml_tensor *> views;
+    views.reserve(n_expert_used);
+    const ggml_tensor * previous = nullptr;
+    int                 n_adds   = 0;
+
+    for (int offset = 1; offset < node_count; ++offset) {
+        const ggml_tensor * candidate = cgraph->nodes[node_idx + offset];
+        ops[offset]                   = candidate->op;
+
+        if (candidate->op == GGML_OP_VIEW) {
+            const int expert = (int) views.size();
+            if (expert >= n_expert_used || candidate->view_src != weighted || candidate->type != GGML_TYPE_F32 ||
+                candidate->ne[0] != weighted->ne[0] || candidate->ne[1] != n_tokens || candidate->ne[2] != 1 ||
+                candidate->ne[3] != 1 || candidate->nb[0] != weighted->nb[0] || candidate->nb[1] != weighted->nb[2] ||
+                candidate->view_offs != (size_t) expert * weighted->nb[1]) {
+                return false;
+            }
+            views.push_back(candidate);
+            continue;
+        }
+
+        if (candidate->op != GGML_OP_ADD || views.size() < 2 || n_adds + 1 >= (int) views.size()) {
+            return false;
+        }
+        const ggml_tensor * lhs = n_adds == 0 ? views[0] : previous;
+        const ggml_tensor * rhs = views[n_adds + 1];
+        if (candidate->src[0] != lhs || candidate->src[1] != rhs || candidate->type != GGML_TYPE_F32) {
+            return false;
+        }
+        previous = candidate;
+        ++n_adds;
+    }
+
+    if ((int) views.size() != n_expert_used || n_adds != n_expert_used - 1 || previous == nullptr) {
+        return false;
+    }
+    if (!ggml_is_contiguous(previous) || previous->ne[0] != weighted->ne[0] || previous->ne[1] != n_tokens ||
+        previous->ne[2] != 1 || previous->ne[3] != 1) {
+        return false;
+    }
+
+    const int output_idx = node_idx + node_count - 1;
+    if (!ggml_can_fuse_subgraph_ext(cgraph, node_idxs.data(), node_count, ops.data(), &output_idx, 1)) {
+        return false;
+    }
+
+    // the fused kernel writes dst while reading both operands, so dst must not alias them
+    ggml_tensor * dst = cgraph->nodes[output_idx];
+    if (ggml_webgpu_tensor_binding_overlap(ctx->global_ctx, experts, dst) ||
+        ggml_webgpu_tensor_binding_overlap(ctx->global_ctx, weights, dst)) {
+        return false;
+    }
+
+    match.experts    = experts;
+    match.weights    = weights;
+    match.dst        = dst;
+    match.node_count = node_count;
+    return true;
+}
+
 static bool ggml_webgpu_can_fuse_gdn_cache(const struct ggml_cgraph * cgraph, int node_idx, int & num_encoded_ops) {
     const ggml_tensor * gdn = cgraph->nodes[node_idx];
 
@@ -4239,9 +4398,17 @@ static std::optional<webgpu_encoded_op> ggml_webgpu_encode(webgpu_context ctx,
             return ggml_webgpu_mul_mat_id(ctx, src0, src1, src2, node);
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_webgpu_flash_attn(ctx, src0, src1, src2, node->src[3], node->src[4], node);
+        case GGML_OP_MUL:
+            {
+                ggml_webgpu_moe_weighted_reduction_match match = {};
+                if (ggml_webgpu_can_fuse_moe_weighted_reduction(cgraph, node_idx, ctx, match)) {
+                    num_encoded_ops = match.node_count;
+                    return ggml_webgpu_moe_weighted_reduction(ctx, match.experts, match.weights, match.dst);
+                }
+            }
+            return ggml_webgpu_binary_op(ctx, src0, src1, node);
         case GGML_OP_ADD:
         case GGML_OP_SUB:
-        case GGML_OP_MUL:
         case GGML_OP_DIV:
             return ggml_webgpu_binary_op(ctx, src0, src1, node);
         case GGML_OP_ADD_ID:
