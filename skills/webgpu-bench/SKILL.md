@@ -17,8 +17,8 @@ different noise and different bottlenecks. Do not mix their numbers into a WebGP
 
 ```
 BENCHMARK:   webgpu-bench - ggml WebGPU (Dawn) backend, native, on one pinned rig
-             (mac-arm64: Apple Silicon); 3 GGUF models, 7 e2e cases (pp/tg) plus a
-             per-op microbench derived from those models' graphs
+             (linux-4090: x86_64 + NVIDIA RTX 4090, Vulkan via Dawn); 3 GGUF models,
+             7 e2e cases (pp/tg) plus a per-op microbench derived from those models' graphs
 RECORD:      $WEBGPU_BENCH_ROOT/runs/<rig>/<YYYYMMDD>-<commit8>-<tag>/ ; accepted = status.json
              {"status":"accepted"} (or needs-review) ; not-a-base = draft, blocked, abandoned
 CASES:       summary.md (e2e: id, avg_ts per invocation, min/median/max, ref_ts) and
@@ -30,7 +30,7 @@ RUN:         scripts/run.sh <tag> ; 3 invocations x (7 cases x -r 5) ; profile s
              baseline (budget 30-60 min per record) ; reuses the HF cache and the built binaries
 PROFILES:    profile/<case>/{cpu,gpu,host}.txt ; cpu = "[ggml_webgpu cpu profiling summary]"
              "name: ms (pct)" ; gpu = "[ggml_webgpu gpu profiling summary]" "shader: ms (pct)" ;
-             there is no inclusive flamegraph - host.txt (sample/perf) is the substitute
+             there is no inclusive flamegraph - host.txt (perf) is the substitute
 PRECHECK:    one test-backend-ops perf case (plus test mode) for a kernel change; one
              instrumented llama-bench run for a host-side change
 DETERMINISM: test-backend-ops test on the touched ops, plus llama-perplexity PPL within 0.1% of
@@ -72,14 +72,18 @@ Three facts about this backend drive the design:
 
 | rig | machine | GPU API | Dawn | notes |
 |---|---|---|---|---|
-| `mac-arm64` | Apple Silicon, 32 GB+ | Metal via Dawn | pinned in `rigs/mac-arm64.json` | the only rig; the same binary also exposes `MTL0`, so `ref_ts` is free |
+| `linux-4090` | x86_64, NVIDIA RTX 4090 24 GB | Vulkan via Dawn | pinned in `rigs/linux-4090.json` | the only rig; built with `-DGGML_VULKAN=ON` the same binary also exposes `VULKAN0`, so `ref_ts` is free |
 
 Rules:
 
 - One rig, one chain. Do not add a second machine to an aggregate, and do not compare a record from
   another machine against this chain.
-- Record the Dawn version, GPU driver version and OS build in `rigs/mac-arm64.json`. A Dawn bump is
-  a new chain: re-baseline before trusting any delta.
+- This host exposes more than one GPU, but the WebGPU backend registers a single device named
+  `WebGPU`. Dawn picks the adapter; record the chosen adapter's name/PCI id in
+  `rigs/linux-4090.json` and run the `VULKAN0` reference on the same card. Keep the host otherwise
+  idle so the adapter and its clocks do not change between invocations.
+- Record the Dawn version, NVIDIA driver version and OS build in `rigs/linux-4090.json`. A Dawn or
+  driver bump is a new chain: re-baseline before trusting any delta.
 - GPU timestamps are not available on every adapter. If the profile build aborts or reports 0 ms,
   mark `gpu.txt` as `unavailable` and fall back to `host.txt` plus the CPU breakdown.
 
@@ -89,7 +93,14 @@ Rules:
 bench          -DGGML_WEBGPU=ON -DCMAKE_BUILD_TYPE=Release
 bench+profile  -DGGML_WEBGPU=ON -DCMAKE_BUILD_TYPE=Release \
                -DGGML_WEBGPU_CPU_PROFILE=ON -DGGML_WEBGPU_GPU_PROFILE=ON
+# optional: add -DGGML_VULKAN=ON to either config to enable the Tier C VULKAN0 reference device
 ```
+
+On Linux Dawn runs on Vulkan, so the timed build needs `libvulkan.so.1` and the NVIDIA ICD at
+runtime, and the Dawn package itself: the build finds it through `find_package(Dawn)`, so point
+`CMAKE_PREFIX_PATH` at the Dawn install. `-DGGML_VULKAN=ON` is only needed for the `VULKAN0`
+reference run and pulls in the Vulkan SDK (`glslc`, Vulkan headers); without it `ref_ts` is `n/a`.
+It never changes WebGPU timing - the two devices share the one NVIDIA driver.
 
 Timed runs use `bench` only. The profile build adds per-batch query resolves and buffer maps, which
 change the timing by a lot, especially for tg. Never compare across configs, and never publish a
@@ -161,12 +172,15 @@ a finding, not noise.
 
 ### Tier C - reference gap (diagnostic only)
 
-The same binary also exposes `MTL0`. Run the same seven cases with `-dev MTL0` and store `ref_ts`
-next to `avg_ts`. Rank targets by `avg_ts / ref_ts`: the case furthest from the platform's own
-backend is where the WebGPU implementation is weakest, which is more useful than ranking by
-absolute t/s. If the reference run is absent the column is `n/a`.
+When the binary is built with `-DGGML_VULKAN=ON` it also exposes `VULKAN0`, the platform's native
+Vulkan backend - the same driver Dawn uses underneath WebGPU. Run the same seven cases with
+`-dev Vulkan0` and store `ref_ts` next to `avg_ts`. Rank targets by `avg_ts / ref_ts`: the case
+furthest from the platform's own backend is where the WebGPU implementation is weakest, which is
+more useful than ranking by absolute t/s. If the reference run is absent the column is `n/a`.
 
-`ref_ts` is never a gate. Metal and WebGPU have different kernels; the gap is a map, not a target.
+`ref_ts` is never a gate. The Vulkan and WebGPU backends have different shaders; the gap is a map,
+not a target. CUDA is deliberately not used as the reference: it is a different compiler and
+runtime, so its gap would mix the WebGPU implementation with a different stack.
 
 ## Record
 
@@ -177,10 +191,10 @@ $WEBGPU_BENCH_ROOT/
     meta.json            commit, dirty flag, Dawn, driver, OS, build configs, commands, model pins
     status.json          {"status": "draft|accepted|needs-review|blocked|abandoned", "note": ...}
     e2e/<id>-<invocation>.json
-    e2e/<id>-ref.json    optional MTL0 reference run
+    e2e/<id>-ref.json    optional VULKAN0 reference run
     e2e/sched-<id>.log   GGML_SCHED_DEBUG=2, one graph per log
     e2e/load.log         first-eval "load time = ..." lines
-    e2e/rss.txt          /usr/bin/time -l for each invocation
+    e2e/rss.txt          /usr/bin/time -v for each invocation
     e2e/ppl.txt          perplexity output for the determinism gate
     ops/perf-{1,2,3}.sql
     ops/cases.md         generated: op, params, us/run per invocation, min/median/max, noisy
@@ -238,7 +252,7 @@ under a minute.
 | kernel / shader | `test-backend-ops perf -b WebGPU -o '<OP>' -p '<case params>'`, then `test-backend-ops test -o '<OP>'` | the case time moves in the predicted direction and the test mode still passes |
 | encode / submit / batch | one `llama-bench -p 0 -n 32 -r 1` on the profile build | `graph_compute` share or the named shader share moves; `set_tensor`/`get_tensor` do not grow |
 | graph shape / fusion | `GGML_SCHED_DEBUG=2` node count plus the GPU profile shader count | fewer nodes or fewer kernels for the same output |
-| buffer / memory | `/usr/bin/time -l` peak RSS on one case | RSS does not grow |
+| buffer / memory | `/usr/bin/time -v` peak RSS on one case | RSS does not grow |
 
 If the pre-check does not move, do not spend a record on it: write the number into the plan and
 take the next experiment.
@@ -343,7 +357,7 @@ Reject or rewrite a change that:
 | `error: no device named '...'` | `-b` takes the device name, which is `WebGPU`, not the backend name | check `--list-devices`, do not guess |
 | every case reports `not supported` | the op list includes ops this backend does not implement | expected; compare with `docs/ops/WebGPU.csv` |
 | the op case list changed between records | the perf set is code | compare the intersection, report added/removed cases |
-| a "win" disappears on `MTL0` | platform-specific path (subgroup matrix, dot product) | fine: `ref_ts` is a map, not a gate; report it and keep the WebGPU number |
+| a "win" disappears on `VULKAN0` | platform-specific path (subgroup matrix, dot product) | fine: `ref_ts` is a map, not a gate; report it and keep the WebGPU number |
 
 ## References
 

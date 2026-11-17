@@ -7,7 +7,7 @@ usage() {
 usage: run.sh --tag <tag> [options]
 
   --tag <tag>        record tag: base | E00N-<slug>            (required)
-  --rig <rig>        rig name, default mac-arm64
+  --rig <rig>        rig name, default linux-4090
   --no-ops           skip the per-op tier
   --no-profile       skip the profile tier
   --no-ppl           skip the perplexity check
@@ -54,7 +54,7 @@ INVOCATIONS=${INVOCATIONS:-3}
 CASES=${CASES:-$REPO_ROOT/skills/webgpu-bench/scripts/cases.tsv}
 CORPUS=${PPL_CORPUS:-$ROOT/corpus/wiki.test.raw}
 
-RIG=${RIG:-mac-arm64}
+RIG=${RIG:-linux-4090}
 
 COMMIT=$(git -C "$REPO_ROOT" rev-parse --short=8 HEAD)
 DIRTY=0
@@ -79,6 +79,10 @@ need() {
 need "$BENCH_BIN"
 [[ $DO_OPS -eq 1 ]] && need "$OPS_BIN"
 [[ $DO_PPL -eq 1 ]] && need "$PPL_BIN"
+if [[ $DRY -eq 0 && ! -x /usr/bin/time ]]; then
+    echo "missing /usr/bin/time (install GNU time: apt install time)" >&2
+    exit 1
+fi
 
 if [[ $DRY -eq 0 ]]; then
     mkdir -p "$OUT"/{e2e,ops,profile}
@@ -95,21 +99,26 @@ model_args() {
 
 rss_wrap() {
     local f=$1; shift
-    /usr/bin/time -l -o "$f" -a "$@"
+    /usr/bin/time -v -o "$f" -a "$@"
 }
 
 write_meta() {
-    local gpu os dawn
-    gpu=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo unknown)
+    local gpu driver os dawn
+    gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)
+    [[ -n "$gpu" ]] || gpu=$(lspci 2>/dev/null | sed -n 's/.*VGA compatible controller: //p' | head -1 || true)
+    [[ -n "$gpu" ]] || gpu=unknown
+    driver=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 || true)
+    [[ -n "$driver" ]] || driver=unknown
     os="$(uname -s) $(uname -r) $(uname -m)"
     dawn=${DAWN_VERSION:-unknown}
     if [[ -s "$ROOT/rigs/$RIG.json" ]]; then
         gpu=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("gpu", ""))' "$ROOT/rigs/$RIG.json")
         dawn=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("dawn_version", ""))' "$ROOT/rigs/$RIG.json")
+        driver=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("driver", ""))' "$ROOT/rigs/$RIG.json")
     fi
 
     RIG_NAME=$RIG TAG_NAME=$TAG COMMIT=$COMMIT DIRTY=$DIRTY OS_NAME=$os GPU_NAME=$gpu \
-    DAWN=$dawn OUT_DIR=$OUT RIG_ROOT=$ROOT CASES_FILE=$CASES REPS=$REPS \
+    DRIVER=$driver DAWN=$dawn OUT_DIR=$OUT RIG_ROOT=$ROOT CASES_FILE=$CASES REPS=$REPS \
     INVOCATIONS=$INVOCATIONS DEV_NAME=$DEV \
     BENCH_BIN=$BENCH_BIN PROF_BIN=$PROF_BIN CORPUS=$CORPUS \
     python3 - <<'PY'
@@ -124,6 +133,7 @@ meta = {
     "dirty": os.environ["DIRTY"] == "1",
     "date": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
     "dawn_version": os.environ["DAWN"],
+    "driver": os.environ["DRIVER"],
     "os": os.environ["OS_NAME"],
     "gpu": os.environ["GPU_NAME"],
     "device": os.environ["DEV_NAME"],
@@ -148,8 +158,11 @@ with open(os.environ["CASES_FILE"]) as f:
         meta["cases"].append({"id": cid, "model": model, "p": int(p), "n": int(n), "d": int(d), "role": role})
 
 if os.path.exists(meta["corpus"]["path"]):
-    h = subprocess.run(["shasum", "-a", "256", meta["corpus"]["path"]], capture_output=True, text=True)
-    meta["corpus"]["sha256"] = h.stdout.split()[0] if h.returncode == 0 else None
+    for hasher in (["sha256sum"], ["shasum", "-a", "256"]):
+        h = subprocess.run(hasher + [meta["corpus"]["path"]], capture_output=True, text=True)
+        if h.returncode == 0:
+            meta["corpus"]["sha256"] = h.stdout.split()[0]
+            break
 
 os.makedirs(out, exist_ok=True)
 with open(os.path.join(out, "meta.json"), "w") as f:
@@ -162,7 +175,8 @@ if not os.path.exists(rig_path):
     os.makedirs(os.path.dirname(rig_path), exist_ok=True)
     with open(rig_path, "w") as f:
         json.dump({"rig": meta["rig"], "gpu": meta["gpu"], "os": meta["os"],
-                   "dawn_version": meta["dawn_version"], "notes": ""}, f, indent=2)
+                   "dawn_version": meta["dawn_version"], "driver": meta["driver"],
+                   "notes": ""}, f, indent=2)
         f.write("\n")
 PY
 }

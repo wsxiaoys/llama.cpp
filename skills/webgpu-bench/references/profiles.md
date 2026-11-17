@@ -62,8 +62,9 @@ How to read it:
 
 Caveats:
 
-- The flag requires adapter timestamp-query support. If the device fails to create or every value
-  is 0, mark the profile `unavailable` and fall back to source 1 plus source 3.
+- The flag requires adapter timestamp-query support. NVIDIA under `VK_QUERY_TYPE_TIMESTAMP`
+  provides it; if the device fails to create or every value is 0 (for example after a driver or
+  Dawn change), mark the profile `unavailable` and fall back to source 1 plus source 3.
 - The flag sets `batch_compute_passes = false`, so every kernel gets its own compute pass instead
   of sharing one. The pass structure itself changes, not just the measurement overhead. A
   `bench+profile` build is never used for a record, and its numbers are not comparable with the
@@ -73,11 +74,20 @@ Caveats:
 
 ## 3. Host sampler (`host.txt`)
 
-The substitute for an inclusive flamegraph, and the only way to see Dawn and the driver:
+The substitute for an inclusive flamegraph, and the only way to see Dawn and the driver. On Linux
+use `perf`:
 
 ```sh
-sample <pid> 10 -file profile/<case>/host.txt
+perf record -F 99 -g -p <pid> -o profile/<case>/perf.data -- sleep 10
+perf script -i profile/<case>/perf.data | stackcollapse-perf.pl > profile/<case>/host.txt
+# or, without the FlameGraph helpers:
+perf report --stdio -i profile/<case>/perf.data > profile/<case>/host.txt
 ```
+
+Run one case with `-r 1`, attach once the model is loaded, and sample for the length of the timed
+run. `perf` needs `perf_event_paranoid` low enough (or root) to sample another process; the frames
+to look for are `wgpu::Queue::Submit`, `CreateCommandEncoder`, pipeline creation, `vkQueueSubmit`
+and the NVIDIA driver (`libnvidia-*`).
 
 Use it when the CPU breakdown says `graph_compute` is large but no shader is hot: the cost is then
 inside Dawn (`wgpu::Queue::Submit`, `CreateCommandEncoder`, pipeline creation) or inside the
@@ -91,7 +101,7 @@ driver, and no backend-level change will remove it without changing the submit p
 | encode / submit / batch size | CPU + host | `graph_compute` share, then Dawn frames in `host.txt` |
 | buffer traffic per token (set/get tensor) | CPU | `set_tensor` + `get_tensor` share |
 | graph shape / fusion | CPU + `GGML_SCHED_DEBUG=2` | node count per token vs shader count in the GPU profile |
-| pipeline creation | host | `CreateComputePipeline` / cache misses in `host.txt` |
+| pipeline creation | host | `CreateComputePipeline` / cache misses in `host.txt` (NVIDIA driver frames show up here too) |
 
 ## Recording a profile
 

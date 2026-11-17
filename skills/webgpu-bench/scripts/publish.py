@@ -50,8 +50,8 @@ def main():
     lines = [
         "# WebGPU backend - %s" % rig,
         "",
-        "Rig: %s, %s, Dawn %s. Case set %s." % (
-            meta.get("gpu"), meta.get("os"), meta.get("dawn_version"), meta.get("case_set")),
+        "Rig: %s, %s, driver %s, Dawn %s. Case set %s." % (
+            meta.get("gpu"), meta.get("os"), meta.get("driver", "?"), meta.get("dawn_version"), meta.get("case_set")),
         "",
         "| date | commit | tag | G | G_pp | G_tg | delta G |",
         "|---|---|---|---|---|---|---|---|",

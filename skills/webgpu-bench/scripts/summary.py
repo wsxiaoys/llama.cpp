@@ -120,10 +120,17 @@ def load_rss(out):
     path = os.path.join(out, "e2e", "rss.txt")
     if not os.path.exists(path):
         return None
-    best = 0
     with open(path, errors="replace") as f:
-        for m in re.finditer(r"(\d+)\s+maximum resident set size", f.read()):
-            best = max(best, int(m.group(1)) // (1024 * 1024))
+        text = f.read()
+    best = 0
+    # GNU time -v: "Maximum resident set size (kbytes): N"
+    for m in re.finditer(r"Maximum resident set size \(kbytes\):\s*(\d+)", text):
+        best = max(best, int(m.group(1)) // 1024)
+    if best:
+        return best
+    # BSD/macOS time -l: "N  maximum resident set size" (bytes)
+    for m in re.finditer(r"(\d+)\s+maximum resident set size", text):
+        best = max(best, int(m.group(1)) // (1024 * 1024))
     return best or None
 
 
@@ -165,9 +172,9 @@ def main():
     lines = []
     lines.append("# %s %s" % (meta.get("rig", "?"), os.path.basename(os.path.normpath(out))))
     lines.append("")
-    lines.append("commit %s, case_set %s, dawn %s, dirty: %s" % (
+    lines.append("commit %s, case_set %s, dawn %s, driver %s, dirty: %s" % (
         meta.get("commit", "?"), meta.get("case_set", "?"), meta.get("dawn_version", "?"),
-        "yes" if meta.get("dirty") else "no"))
+        meta.get("driver", "?"), "yes" if meta.get("dirty") else "no"))
     lines.append("")
     n_inv = max((len(v) for v in ts.values()), default=1)
     lines.append("| id | case | " + " | ".join("ts run%d" % (i + 1) for i in range(n_inv)) +
