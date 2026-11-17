@@ -1849,14 +1849,24 @@ static void ggml_webgpu_mul_mat_sg_tile(const webgpu_capabilities & caps, uint32
     tile_n = WEBGPU_MUL_MAT_SUBGROUP_N * WEBGPU_MUL_MAT_SUBGROUP_MATRIX_N * caps.sg_mat_n;
 }
 
+// The subgroup matrix K tile is fixed per src0 type; the split rule needs it to leave at least one
+// tile per split.
+static uint32_t ggml_webgpu_mul_mat_sg_tile_k(const ggml_tensor * src0) {
+    return ggml_is_quantized(src0->type) ? WEBGPU_MUL_MAT_SUBGROUP_TILE_K_QUANT : WEBGPU_MUL_MAT_SUBGROUP_TILE_K_FLOAT;
+}
+
 // Number of K splits for a dense subgroup matrix MUL_MAT: each split takes a contiguous K range of
 // the same tile, so the grid grows without changing the tile. Keep the largest split that still
-// fits WEBGPU_MUL_MAT_SPLIT_K_TARGET_WGS workgroups.
-static uint32_t ggml_webgpu_mul_mat_split_k(uint64_t grid) {
+// fits WEBGPU_MUL_MAT_SPLIT_K_TARGET_WGS workgroups and leaves at least one K tile per split.
+static uint32_t ggml_webgpu_mul_mat_split_k(uint64_t grid, uint64_t k, uint32_t tile_k) {
     for (uint32_t split_k = WEBGPU_MUL_MAT_SPLIT_K_MAX; split_k >= 2; split_k >>= 1) {
-        if (grid * split_k <= WEBGPU_MUL_MAT_SPLIT_K_TARGET_WGS) {
-            return split_k;
+        if (grid * split_k > WEBGPU_MUL_MAT_SPLIT_K_TARGET_WGS) {
+            continue;
         }
+        if (k < (uint64_t) split_k * tile_k) {
+            continue;
+        }
+        return split_k;
     }
     return 1;
 }
@@ -1899,7 +1909,7 @@ static webgpu_encoded_op ggml_webgpu_mul_mat(webgpu_context & ctx,
         ggml_webgpu_mul_mat_sg_tile(ctx->global_ctx->capabilities, tile_m, tile_n);
         const uint64_t grid = CEIL_DIV((uint64_t) dst->ne[0], tile_m) * CEIL_DIV((uint64_t) dst->ne[1], tile_n) *
                               (uint64_t) dst->ne[2] * (uint64_t) dst->ne[3];
-        split_k             = ggml_webgpu_mul_mat_split_k(grid);
+        split_k             = ggml_webgpu_mul_mat_split_k(grid, src0->ne[0], ggml_webgpu_mul_mat_sg_tile_k(src0));
     }
 
     // With a K split the shader writes its partial tile into the dst tail, which
@@ -5337,10 +5347,11 @@ static size_t ggml_backend_webgpu_buffer_type_get_alloc_size(ggml_backend_buffer
                     uint32_t tile_m;
                     uint32_t tile_n;
                     ggml_webgpu_mul_mat_sg_tile(ctx->webgpu_global_ctx->capabilities, tile_m, tile_n);
-                    const uint64_t grid    = CEIL_DIV((uint64_t) tensor->ne[0], tile_m) *
-                                             CEIL_DIV((uint64_t) tensor->ne[1], tile_n) * (uint64_t) tensor->ne[2] *
-                                             (uint64_t) tensor->ne[3];
-                    const uint32_t split_k = ggml_webgpu_mul_mat_split_k(grid);
+                    const uint64_t grid = CEIL_DIV((uint64_t) tensor->ne[0], tile_m) *
+                                          CEIL_DIV((uint64_t) tensor->ne[1], tile_n) * (uint64_t) tensor->ne[2] *
+                                          (uint64_t) tensor->ne[3];
+                    const uint32_t split_k =
+                        ggml_webgpu_mul_mat_split_k(grid, src0->ne[0], ggml_webgpu_mul_mat_sg_tile_k(src0));
                     if (split_k > 1) {
                         const size_t align =
                             ctx->webgpu_global_ctx->capabilities.limits.minStorageBufferOffsetAlignment;
