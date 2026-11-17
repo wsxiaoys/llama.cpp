@@ -13,6 +13,19 @@ Rig: NVIDIA GeForce RTX 4090, Linux 6.8.0-149-generic x86_64, driver 595.91.07, 
 | 2026-11-17 | a032ae69 | E008-moe-gather-skip-full | 586.12 | 5149.48 | 114.56 | +1.4% |
 | 2026-11-17 | 0544c3bd | E024-mxfp4-lut-full | 603.65 | 5165.16 | 120.50 | +3.0% |
 
+## base -> latest (per case)
+
+| id | case | base ts | latest ts | delta |
+|---|---|---|---|---|
+| a1 | smallest dense prefill | 10923.20 | 10653.00 | -2.5% |
+| a2 | smallest dense decode | 116.75 | 145.23 | +24.4% |
+| a3 | mid dense prefill | 4149.12 | 4117.96 | -0.8% |
+| a4 | mid dense decode | 88.88 | 122.37 | +37.7% |
+| a5 | MoE prefill | 908.54 | 3122.40 | +243.7% |
+| a6 | MoE decode | 80.60 | 99.55 | +23.5% |
+| g1 | long-KV guard | 86.28 | 117.62 | +36.3% |
+| **G** | geomean over cases | 434.60 | 603.65 | +38.9% |
+
 ## latest
 
 commit 0544c3bd, case_set v1, dawn v20260908.214631 / 94c3c9c, driver 595.91.07, dirty: no
