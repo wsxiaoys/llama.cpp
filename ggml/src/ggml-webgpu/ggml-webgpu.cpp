@@ -3071,6 +3071,17 @@ static webgpu_encoded_op ggml_webgpu_repeat(webgpu_context & ctx, ggml_tensor * 
     return ggml_backend_webgpu_build(ctx, pipeline, params, entries, wg_x, wg_y);
 }
 
+// The fused norm dispatches one workgroup per row and reduces the row across that workgroup, so
+// size the workgroup to the row instead of the device maximum: a per-head QK norm row of 128
+// elements otherwise launches 1024 threads and barrier-reduces over all of them.
+static uint32_t ggml_webgpu_rms_norm_mul_wg_size(const uint32_t ne0, const uint32_t max_wg_size) {
+    uint32_t wg_size = 64;
+    while (wg_size < ne0 && wg_size < max_wg_size) {
+        wg_size *= 2;
+    }
+    return std::min(wg_size, max_wg_size);
+}
+
 static std::optional<webgpu_encoded_op> ggml_webgpu_rms_norm_mul(webgpu_context & ctx,
                                                                  ggml_tensor *    rn_src,
                                                                  ggml_tensor *    rn_dst,
@@ -3123,7 +3134,8 @@ static std::optional<webgpu_encoded_op> ggml_webgpu_rms_norm_mul(webgpu_context 
     shader_lib_ctx.src0                           = rn_src;
     shader_lib_ctx.src1                           = mul_src;
     shader_lib_ctx.dst                            = dst;
-    shader_lib_ctx.max_wg_size = ctx->global_ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup;
+    shader_lib_ctx.max_wg_size                    = ggml_webgpu_rms_norm_mul_wg_size(
+        (uint32_t) dst->ne[0], ctx->global_ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup);
 
     const bool      src_overlap = ggml_webgpu_tensor_binding_overlap(ctx->global_ctx, rn_src, mul_src);
     webgpu_pipeline pipeline    = ctx->shader_lib->get_rms_norm_mul_pipeline(shader_lib_ctx, src_overlap);
