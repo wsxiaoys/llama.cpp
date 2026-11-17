@@ -44,6 +44,9 @@ struct MulMatParams {
     limit: f32,
     pad0: u32
 #endif
+#ifdef ADD_RESIDUAL
+    , offset_residual: u32
+#endif
 };
 
 #if defined(MMVQ)
@@ -66,8 +69,14 @@ struct MulMatParams {
 #endif
 
 @group(0) @binding(DST_BINDING) var<storage, read_write> dst: array<f32>;
+#ifdef ADD_RESIDUAL
+@group(0) @binding(DST_BINDING + 1) var<storage, read_write> residual: array<f32>;
+#define PARAMS_BINDING (DST_BINDING + 2)
+#else
+#define PARAMS_BINDING (DST_BINDING + 1)
+#endif
 // "mul_mat_vec_acc.tmpl" requires params.k, params.m, params.stride_01
-@group(0) @binding(DST_BINDING + 1) var<uniform> params: MulMatParams;
+@group(0) @binding(PARAMS_BINDING) var<uniform> params: MulMatParams;
 
 // The fused variant reduces both the gate and the up dot products before applying the GLU.
 #ifdef FUSE_GLU
@@ -123,6 +132,10 @@ fn main(
     let src0_up_batch_offset = params.offset_src0_up + src03_idx * params.stride_03 + src02_idx * params.stride_02;
 #endif
     let dst_idx_base = params.offset_dst + dst3_idx * dst3_stride + dst2_idx * dst2_stride + row_base;
+#ifdef ADD_RESIDUAL
+    // the residual has the destination's shape and is contiguous, so it shares the linear layout
+    let residual_idx_base = params.offset_residual + dst3_idx * dst3_stride + dst2_idx * dst2_stride + row_base;
+#endif
 
 #ifdef MMVQ
     let src1q_idx_base = (src13_idx * params.bs02 * params.broadcast2 + src12_idx) * params.n * (params.k / 32u);
@@ -216,7 +229,12 @@ fn main(
                 }
                 let row_total = subgroupAdd(row_acc);
                 if (subgroup_invocation_id == 0) {
+#ifdef ADD_RESIDUAL
+                    dst[dst_idx_base + col * params.m + row] =
+                        row_total + residual[residual_idx_base + col * params.m + row];
+#else
                     dst[dst_idx_base + col * params.m + row] = row_total;
+#endif
                 }
             }
 #endif
@@ -244,7 +262,13 @@ fn main(
             if (thread_id < OUTPUTS_PER_WG) {
                 let output_row = row_base + thread_id;
                 if (output_row < params.m) {
+#ifdef ADD_RESIDUAL
+                    dst[dst_idx_base + col * params.m + thread_id] =
+                        partial_sums[partial_index(thread_id, 0)] +
+                        residual[residual_idx_base + col * params.m + thread_id];
+#else
                     dst[dst_idx_base + col * params.m + thread_id] = partial_sums[partial_index(thread_id, 0)];
+#endif
                 }
             }
 #endif

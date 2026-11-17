@@ -999,12 +999,13 @@ struct ggml_webgpu_mul_mat_vec_pipeline_key {
     bool        use_mmvq;
     bool        src_overlap;
     bool        fuse_glu;
+    bool        add_residual;
     ggml_glu_op glu_op;
 
     bool operator==(const ggml_webgpu_mul_mat_vec_pipeline_key & other) const {
         return src0_type == other.src0_type && src1_type == other.src1_type && vectorized == other.vectorized &&
                num_cols == other.num_cols && use_mmvq == other.use_mmvq && src_overlap == other.src_overlap &&
-               fuse_glu == other.fuse_glu && glu_op == other.glu_op;
+               fuse_glu == other.fuse_glu && add_residual == other.add_residual && glu_op == other.glu_op;
     }
 };
 
@@ -1018,6 +1019,7 @@ struct ggml_webgpu_mul_mat_vec_pipeline_key_hash {
         ggml_webgpu_hash_combine(seed, key.use_mmvq);
         ggml_webgpu_hash_combine(seed, key.src_overlap);
         ggml_webgpu_hash_combine(seed, key.fuse_glu);
+        ggml_webgpu_hash_combine(seed, key.add_residual);
         ggml_webgpu_hash_combine(seed, key.glu_op);
         return seed;
     }
@@ -2152,20 +2154,23 @@ class ggml_webgpu_shader_lib {
 
     webgpu_pipeline get_mul_mat_vec_pipeline(const ggml_webgpu_shader_lib_context & context,
                                              bool                                   src_overlap,
-                                             bool                                   fuse_glu) {
+                                             bool                                   fuse_glu,
+                                             bool                                   add_residual) {
+        GGML_ASSERT(!(fuse_glu && add_residual));
         ggml_webgpu_mul_mat_vec_pipeline_key key = {};
         key.src0_type                            = context.src0->type;
         key.src1_type                            = context.src1->type;
-        key.vectorized  = (context.src0->ne[0] % 4 == 0 &&
-                           (context.src0->type == GGML_TYPE_F32 || context.src0->type == GGML_TYPE_F16)) ?
-                              1 :
-                              0;
-        key.num_cols    = context.dst->ne[1];
-        key.use_mmvq    = ggml_webgpu_can_use_mmvq(context.src0, context.src1, context.src1->ne[1],
-                                                   context.supports_dot_product, context.vendor);
-        key.src_overlap = src_overlap;
-        key.fuse_glu    = fuse_glu;
-        key.glu_op      = fuse_glu ? ggml_get_glu_op(context.dst) : GGML_GLU_OP_SWIGLU;
+        key.vectorized   = (context.src0->ne[0] % 4 == 0 &&
+                            (context.src0->type == GGML_TYPE_F32 || context.src0->type == GGML_TYPE_F16)) ?
+                               1 :
+                               0;
+        key.num_cols     = context.dst->ne[1];
+        key.use_mmvq     = ggml_webgpu_can_use_mmvq(context.src0, context.src1, context.src1->ne[1],
+                                                    context.supports_dot_product, context.vendor);
+        key.src_overlap  = src_overlap;
+        key.fuse_glu     = fuse_glu;
+        key.add_residual = add_residual;
+        key.glu_op       = fuse_glu ? ggml_get_glu_op(context.dst) : GGML_GLU_OP_SWIGLU;
 
         auto it = mul_mat_vec_pipelines.find(key);
         if (it != mul_mat_vec_pipelines.end()) {
@@ -2298,6 +2303,11 @@ class ggml_webgpu_shader_lib {
             defines.push_back("FUSE_GLU");
             defines.push_back(op_define);
             variant += std::string("_fuse_") + op_define;
+        }
+
+        if (key.add_residual) {
+            defines.push_back("ADD_RESIDUAL");
+            variant += "_add_residual";
         }
 
         if (key.src_overlap) {
