@@ -1331,15 +1331,16 @@ class ggml_webgpu_shader_lib {
     wgpu::Device           device;
     pre_wgsl::Preprocessor preprocessor;
 
-    std::unordered_map<int, webgpu_pipeline> sum_rows_pipelines;       // key is whether to compute the mean
-    std::unordered_map<int, webgpu_pipeline> argmax_pipelines;         // key is vec4
-    std::unordered_map<int, webgpu_pipeline> argsort_pipelines;        // key is order
-    std::unordered_map<int, webgpu_pipeline> argsort_merge_pipelines;  // key is order
-    std::unordered_map<int, webgpu_pipeline> cumsum_pipelines;         // key is fixed, no variants yet
-    std::unordered_map<int, webgpu_pipeline> arange_pipelines;         // key is fixed, no variants yet
-    std::unordered_map<int, webgpu_pipeline> count_equal_pipelines;    // key is src_overlap
+    std::unordered_map<int, webgpu_pipeline> sum_rows_pipelines;                // key is whether to compute the mean
+    std::unordered_map<int, webgpu_pipeline> argmax_pipelines;                  // key is vec4
+    std::unordered_map<int, webgpu_pipeline> argsort_pipelines;                 // key is order
+    std::unordered_map<int, webgpu_pipeline> argsort_merge_pipelines;           // key is order
+    std::unordered_map<int, webgpu_pipeline> cumsum_pipelines;                  // key is fixed, no variants yet
+    std::unordered_map<int, webgpu_pipeline> arange_pipelines;                  // key is fixed, no variants yet
+    std::unordered_map<int, webgpu_pipeline> count_equal_pipelines;             // key is src_overlap
+    std::unordered_map<int, webgpu_pipeline> moe_weighted_reduction_pipelines;  // key is fixed, no variants yet
     std::unordered_map<ggml_webgpu_row_norm_pipeline_key, webgpu_pipeline, ggml_webgpu_row_norm_pipeline_key_hash>
-        row_norm_pipelines;                                            // op/inplace
+        row_norm_pipelines;                                                     // op/inplace
 
     std::unordered_map<ggml_webgpu_get_rows_pipeline_key, webgpu_pipeline, ggml_webgpu_get_rows_pipeline_key_hash>
         get_rows_pipelines;   // src_type, vectorized
@@ -1442,6 +1443,17 @@ class ggml_webgpu_shader_lib {
         auto processed             = preprocessor.preprocess(wgsl_count_equal, defines);
         count_equal_pipelines[key] = ggml_webgpu_create_pipeline(device, processed, "count_equal");
         return count_equal_pipelines[key];
+    }
+
+    webgpu_pipeline get_moe_weighted_reduction_pipeline(const ggml_webgpu_shader_lib_context & context) {
+        auto it = moe_weighted_reduction_pipelines.find(0);
+        if (it != moe_weighted_reduction_pipelines.end()) {
+            return it->second;
+        }
+        std::vector<std::string> defines    = { "WG_SIZE=" + std::to_string(context.max_wg_size) };
+        auto                     processed  = preprocessor.preprocess(wgsl_moe_weighted_reduction, defines);
+        moe_weighted_reduction_pipelines[0] = ggml_webgpu_create_pipeline(device, processed, "moe_weighted_reduction");
+        return moe_weighted_reduction_pipelines[0];
     }
 
     webgpu_pipeline get_sum_rows_pipeline(const ggml_webgpu_shader_lib_context & context) {
