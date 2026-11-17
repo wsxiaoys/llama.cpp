@@ -2152,17 +2152,28 @@ static webgpu_encoded_op ggml_webgpu_mul_mat_id_vec(webgpu_context & ctx,
     return ggml_backend_webgpu_build(ctx, pipeline, params, entries, wg_x, wg_y);
 }
 
-// upper bound on the number of slot tiles emitted by mul_mat_id_gather.wgsl
-static uint32_t ggml_webgpu_mul_mat_id_max_tiles(const ggml_tensor * dst) {
+// upper bound on the number of slot tiles emitted by mul_mat_id_gather.wgsl for a given tile width
+static uint32_t ggml_webgpu_mul_mat_id_max_tiles(const ggml_tensor * dst, uint32_t tile_n_slots) {
     const uint32_t n_expert = (uint32_t) dst->src[0]->ne[2];
     const uint32_t n_slots  = (uint32_t) (dst->ne[1] * dst->ne[2]);  // n_expert_used * n_tokens
 
-    return CEIL_DIV(n_slots, WEBGPU_MUL_MAT_TILE_N * WEBGPU_MUL_MAT_WG_SIZE_N) + std::min(n_expert, n_slots);
+    return CEIL_DIV(n_slots, tile_n_slots) + std::min(n_expert, n_slots);
+}
+
+// the narrowest slot tile any mul_mat_id path can emit, so the descriptor buffer stays an upper bound
+static uint32_t ggml_webgpu_mul_mat_id_min_tile_n_slots(const webgpu_global_context & global_ctx) {
+    const uint32_t reg_tile = WEBGPU_MUL_MAT_TILE_N * WEBGPU_MUL_MAT_WG_SIZE_N;
+    if (!global_ctx->capabilities.supports_subgroup_matrix) {
+        return reg_tile;
+    }
+    const uint32_t sg_tile =
+        WEBGPU_MUL_MAT_SUBGROUP_N * WEBGPU_MUL_MAT_SUBGROUP_MATRIX_N * global_ctx->capabilities.sg_mat_n;
+    return std::min(reg_tile, sg_tile);
 }
 
 // tile count followed by (expert, first slot, n slots) per tile
-static size_t ggml_webgpu_mul_mat_id_tiles_nbytes(const ggml_tensor * dst) {
-    return (1 + 3 * (size_t) ggml_webgpu_mul_mat_id_max_tiles(dst)) * sizeof(uint32_t);
+static size_t ggml_webgpu_mul_mat_id_tiles_nbytes(const ggml_tensor * dst, uint32_t tile_n_slots) {
+    return (1 + 3 * (size_t) ggml_webgpu_mul_mat_id_max_tiles(dst, tile_n_slots)) * sizeof(uint32_t);
 }
 
 static webgpu_encoded_op ggml_webgpu_mul_mat_id(webgpu_context & ctx,
@@ -2180,7 +2191,12 @@ static webgpu_encoded_op ggml_webgpu_mul_mat_id(webgpu_context & ctx,
     shader_lib_ctx.src1                           = src1;
     shader_lib_ctx.src2                           = src2;
     shader_lib_ctx.dst                            = dst;
-    shader_lib_ctx.max_wg_size = ctx->global_ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup;
+    shader_lib_ctx.max_wg_size              = ctx->global_ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup;
+    shader_lib_ctx.supports_subgroup_matrix = ctx->global_ctx->capabilities.supports_subgroup_matrix;
+    shader_lib_ctx.sg_mat_m                 = ctx->global_ctx->capabilities.sg_mat_m;
+    shader_lib_ctx.sg_mat_n                 = ctx->global_ctx->capabilities.sg_mat_n;
+    shader_lib_ctx.sg_mat_k                 = ctx->global_ctx->capabilities.sg_mat_k;
+    shader_lib_ctx.max_subgroup_size        = ctx->global_ctx->capabilities.max_subgroup_size;
 
     // Get or create pipeline
     webgpu_pipeline gather_pipeline;
@@ -2188,8 +2204,16 @@ static webgpu_encoded_op ggml_webgpu_mul_mat_id(webgpu_context & ctx,
 
     std::vector<webgpu_dispatch_desc> dispatches;
 
-    gather_pipeline = ctx->shader_lib->get_mul_mat_id_gather_pipeline(shader_lib_ctx);
-    main_pipeline   = ctx->shader_lib->get_mul_mat_id_pipeline(shader_lib_ctx);
+    main_pipeline         = ctx->shader_lib->get_mul_mat_id_pipeline(shader_lib_ctx);
+    auto * main_decisions = static_cast<ggml_webgpu_mul_mat_shader_decisions *>(main_pipeline.context.get());
+
+    // one gather descriptor per this many slots; the main shader consumes exactly one per workgroup
+    const uint32_t tile_n_slots =
+        main_decisions->use_subgroup_matrix ?
+            WEBGPU_MUL_MAT_SUBGROUP_N * WEBGPU_MUL_MAT_SUBGROUP_MATRIX_N * ctx->global_ctx->capabilities.sg_mat_n :
+            WEBGPU_MUL_MAT_TILE_N * WEBGPU_MUL_MAT_WG_SIZE_N;
+
+    gather_pipeline = ctx->shader_lib->get_mul_mat_id_gather_pipeline(shader_lib_ctx, tile_n_slots);
 
     const uint32_t param_n_expert      = (uint32_t) src0->ne[2];
     const uint32_t param_n_expert_used = (uint32_t) dst->ne[1];
@@ -2208,7 +2232,7 @@ static webgpu_encoded_op ggml_webgpu_mul_mat_id(webgpu_context & ctx,
 
     const size_t dst_offset       = ggml_webgpu_tensor_offset(dst);
     const size_t ids_cache_nbytes = src2->ne[0] * src1->ne[2] * sizeof(uint32_t);
-    const size_t ids_tiles_nbytes = ggml_webgpu_mul_mat_id_tiles_nbytes(dst);
+    const size_t ids_tiles_nbytes = ggml_webgpu_mul_mat_id_tiles_nbytes(dst, tile_n_slots);
 
     const size_t ids_cache_align_offset = ROUNDUP_POW2(
         dst_offset + ggml_nbytes(dst), ctx->global_ctx->capabilities.limits.minStorageBufferOffsetAlignment);
@@ -2266,14 +2290,17 @@ static webgpu_encoded_op ggml_webgpu_mul_mat_id(webgpu_context & ctx,
     uint32_t wg_x = 1;
     uint32_t wg_y = 1;
 
-    auto * main_decisions = static_cast<ggml_webgpu_mul_mat_shader_decisions *>(main_pipeline.context.get());
+    // the slot tile width is decided by the gather pipeline and consumed by the main shader
+    uint32_t tile_m_s;
+    if (main_decisions->use_subgroup_matrix) {
+        tile_m_s =
+            main_decisions->subgroup_m * main_decisions->subgroup_matrix_m * ctx->global_ctx->capabilities.sg_mat_m;
+    } else {
+        tile_m_s = main_decisions->tile_m * main_decisions->wg_size_m;
+    }
 
-    // must match `TILE_N_SLOTS` of mul_mat_id_gather.wgsl
-    GGML_ASSERT(main_decisions->tile_n * main_decisions->wg_size_n == WEBGPU_MUL_MAT_TILE_N * WEBGPU_MUL_MAT_WG_SIZE_N);
-
-    const uint32_t tile_m_s = main_decisions->tile_m * main_decisions->wg_size_m;
     const uint32_t wg_m     = CEIL_DIV(dst->ne[0], tile_m_s);
-    const uint32_t total_wg = wg_m * ggml_webgpu_mul_mat_id_max_tiles(dst);
+    const uint32_t total_wg = wg_m * ggml_webgpu_mul_mat_id_max_tiles(dst, tile_n_slots);
 
     compute_2d_workgroups(total_wg, ctx->global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension, wg_x, wg_y);
 
@@ -4891,8 +4918,9 @@ static size_t ggml_backend_webgpu_buffer_type_get_alloc_size(ggml_backend_buffer
                 const ggml_tensor * src1 = tensor->src[1];
                 if (src0 && src1) {
                     const size_t ids_cache_size = sizeof(uint32_t) * tensor->ne[1] * tensor->ne[2];
-                    const size_t ids_tiles_size = ggml_webgpu_mul_mat_id_tiles_nbytes(tensor);
-                    res                         = ROUNDUP_POW2(
+                    const size_t ids_tiles_size = ggml_webgpu_mul_mat_id_tiles_nbytes(
+                        tensor, ggml_webgpu_mul_mat_id_min_tile_n_slots(ctx->webgpu_global_ctx));
+                    res = ROUNDUP_POW2(
                         res + ids_cache_size + ids_tiles_size +
                             ctx->webgpu_global_ctx->capabilities.limits.minStorageBufferOffsetAlignment * 2,
                         WEBGPU_STORAGE_BUF_BINDING_MULT);
