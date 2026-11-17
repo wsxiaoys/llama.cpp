@@ -287,8 +287,8 @@ fn init_shmem_src0(thread_id: u32, batch_offset: u32, offset_m: u32, k_outer: u3
                 let q_packed = load_u32_at_src0(q_byte_offset);
                 for (var k = 0u; k < BYTES_PER_INNER_LOOP; k++) {
                     let q_byte = get_byte(q_packed, k);
-                    let q_hi = f32(kvalues_mxfp4[(q_byte >> 4) & 0xF]) * e;
-                    let q_lo = f32(kvalues_mxfp4[q_byte & 0xF]) * e;
+                    let q_hi = e2m1_to_f32((q_byte >> 4) & 0xF) * e;
+                    let q_lo = e2m1_to_f32(q_byte & 0xF) * e;
                     shmem[shmem_idx + j * BYTES_PER_INNER_LOOP + k] = f16(q_lo);
                     shmem[shmem_idx + j * BYTES_PER_INNER_LOOP + k + 16u] = f16(q_hi);
                 }
