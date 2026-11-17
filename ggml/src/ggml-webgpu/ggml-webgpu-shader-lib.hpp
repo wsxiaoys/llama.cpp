@@ -55,7 +55,7 @@
 // resident workgroup count leaves SMs idle. Splitting K adds workgroups at the same tile size.
 // TARGET_WGS is in workgroups: on the 4090 the K-loop shortens faster than the per-workgroup
 // overhead grows up to ~3 waves of 128 SMs, and beyond that the reduction traffic dominates.
-#define WEBGPU_MUL_MAT_SPLIT_K_MAX            4u
+#define WEBGPU_MUL_MAT_SPLIT_K_MAX            8u
 #define WEBGPU_MUL_MAT_SPLIT_K_TARGET_WGS     384u
 #define WEBGPU_MUL_MAT_SPLIT_K_REDUCE_WG_SIZE 256u
 
