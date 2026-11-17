@@ -313,12 +313,14 @@ struct ggml_webgpu_row_norm_pipeline_key_hash {
 /** RMS_NORM + MUL **/
 
 struct ggml_webgpu_rms_norm_mul_pipeline_key {
-    bool inplace;      // rn_src == dst
-    bool overlap;      // mul_src == dst
-    bool src_overlap;  // rn_src binding overlaps mul_src binding
+    bool     inplace;      // rn_src == dst
+    bool     overlap;      // mul_src == dst
+    bool     src_overlap;  // rn_src binding overlaps mul_src binding
+    uint32_t wg_size;      // workgroup width, chosen from the row length
 
     bool operator==(const ggml_webgpu_rms_norm_mul_pipeline_key & other) const {
-        return inplace == other.inplace && overlap == other.overlap && src_overlap == other.src_overlap;
+        return inplace == other.inplace && overlap == other.overlap && src_overlap == other.src_overlap &&
+               wg_size == other.wg_size;
     }
 };
 
@@ -328,6 +330,7 @@ struct ggml_webgpu_rms_norm_mul_pipeline_key_hash {
         ggml_webgpu_hash_combine(seed, key.inplace);
         ggml_webgpu_hash_combine(seed, key.overlap);
         ggml_webgpu_hash_combine(seed, key.src_overlap);
+        ggml_webgpu_hash_combine(seed, key.wg_size);
         return seed;
     }
 };
@@ -2967,6 +2970,7 @@ class ggml_webgpu_shader_lib {
         key.inplace                               = ggml_webgpu_tensor_equal(context.src0, context.dst);
         key.overlap                               = ggml_webgpu_tensor_equal(context.src1, context.dst);
         key.src_overlap                           = src_overlap;
+        key.wg_size                               = context.max_wg_size;
 
         auto it = rms_norm_mul_pipelines.find(key);
         if (it != rms_norm_mul_pipelines.end()) {
@@ -2988,11 +2992,11 @@ class ggml_webgpu_shader_lib {
             variant += "_src_overlap";
         }
 
-        defines.push_back(std::string("WG_SIZE=") + std::to_string(context.max_wg_size));
+        defines.push_back(std::string("WG_SIZE=") + std::to_string(key.wg_size));
 
         auto processed                  = preprocessor.preprocess(wgsl_rms_norm_mul, defines);
         auto pipeline_decisions         = std::make_shared<ggml_webgpu_rms_norm_mul_shader_decisions>();
-        pipeline_decisions->wg_size     = context.max_wg_size;
+        pipeline_decisions->wg_size     = key.wg_size;
         pipeline_decisions->inplace     = key.inplace;
         pipeline_decisions->overlap     = key.overlap;
         pipeline_decisions->src_overlap = key.src_overlap;
