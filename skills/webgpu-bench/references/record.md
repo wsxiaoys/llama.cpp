@@ -5,7 +5,7 @@
 ```
 $WEBGPU_BENCH_ROOT/                      default ~/webgpu-bench
   rigs/<rig>.json                        machine, GPU, driver, Dawn, OS, build flags
-  runs/<rig>/<YYYYMMDD>-<commit8>-<tag>/
+  runs/mac-arm64/<YYYYMMDD>-<commit8>-<tag>/
     meta.json
     status.json
     e2e/<id>-<invocation>.json
@@ -108,8 +108,8 @@ load time = <ms>
 - a2: mul_mat_vec 120.4 ms (61.2%), ...
 ```
 
-Numbers are read from the record files only. The `ref_ts` column is filled from the `MTL0` (or
-CUDA) runs when they exist, otherwise `n/a`.
+Numbers are read from the record files only. The `ref_ts` column is filled from the `MTL0` runs
+when they exist, otherwise `n/a`.
 
 ## `ops/cases.md`
 

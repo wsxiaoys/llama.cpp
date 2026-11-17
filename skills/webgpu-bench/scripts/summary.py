@@ -122,14 +122,8 @@ def load_rss(out):
         return None
     best = 0
     with open(path, errors="replace") as f:
-        for line in f:
-            m = re.search(r"Maximum resident set size \(kbytes\):\s*(\d+)", line)
-            if m:
-                best = max(best, int(m.group(1)) // 1024)
-                continue
-            m = re.search(r"(\d+)\s+maximum resident set size", line)
-            if m:
-                best = max(best, int(m.group(1)) // (1024 * 1024))
+        for m in re.finditer(r"(\d+)\s+maximum resident set size", f.read()):
+            best = max(best, int(m.group(1)) // (1024 * 1024))
     return best or None
 
 

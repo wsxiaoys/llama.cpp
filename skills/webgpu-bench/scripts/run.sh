@@ -7,7 +7,7 @@ usage() {
 usage: run.sh --tag <tag> [options]
 
   --tag <tag>        record tag: base | E00N-<slug>            (required)
-  --rig <rig>        rig name, default mac-arm64 on Darwin, linux-t4 on a T4
+  --rig <rig>        rig name, default mac-arm64
   --no-ops           skip the per-op tier
   --no-profile       skip the profile tier
   --no-ppl           skip the perplexity check
@@ -54,15 +54,7 @@ INVOCATIONS=${INVOCATIONS:-3}
 CASES=${CASES:-$REPO_ROOT/skills/webgpu-bench/scripts/cases.tsv}
 CORPUS=${PPL_CORPUS:-$ROOT/corpus/wiki.test.raw}
 
-if [[ -z "$RIG" ]]; then
-    if [[ $(uname -s) == Darwin ]]; then
-        RIG=mac-arm64
-    elif nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | grep -qi 'T4'; then
-        RIG=linux-t4
-    else
-        RIG=linux
-    fi
-fi
+RIG=${RIG:-mac-arm64}
 
 COMMIT=$(git -C "$REPO_ROOT" rev-parse --short=8 HEAD)
 DIRTY=0
@@ -103,17 +95,12 @@ model_args() {
 
 rss_wrap() {
     local f=$1; shift
-    if [[ $(uname -s) == Darwin ]]; then
-        /usr/bin/time -l -o "$f" -a "$@"
-    else
-        /usr/bin/time -v -o "$f" -a "$@"
-    fi
+    /usr/bin/time -l -o "$f" -a "$@"
 }
 
 write_meta() {
     local gpu os dawn
-    gpu=$( (nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo '') | head -1)
-    [[ -n "$gpu" ]] || gpu=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo unknown)
+    gpu=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo unknown)
     os="$(uname -s) $(uname -r) $(uname -m)"
     dawn=${DAWN_VERSION:-unknown}
     if [[ -s "$ROOT/rigs/$RIG.json" ]]; then
@@ -126,7 +113,7 @@ write_meta() {
     INVOCATIONS=$INVOCATIONS DEV_NAME=$DEV \
     BENCH_BIN=$BENCH_BIN PROF_BIN=$PROF_BIN CORPUS=$CORPUS \
     python3 - <<'PY'
-import json, os, platform, subprocess, datetime
+import json, os, subprocess, datetime
 
 out = os.environ["OUT_DIR"]
 meta = {
@@ -161,8 +148,7 @@ with open(os.environ["CASES_FILE"]) as f:
         meta["cases"].append({"id": cid, "model": model, "p": int(p), "n": int(n), "d": int(d), "role": role})
 
 if os.path.exists(meta["corpus"]["path"]):
-    cmd = ["shasum", "-a", "256"] if platform.system() == "Darwin" else ["sha256sum"]
-    h = subprocess.run(cmd + [meta["corpus"]["path"]], capture_output=True, text=True)
+    h = subprocess.run(["shasum", "-a", "256", meta["corpus"]["path"]], capture_output=True, text=True)
     meta["corpus"]["sha256"] = h.stdout.split()[0] if h.returncode == 0 else None
 
 os.makedirs(out, exist_ok=True)

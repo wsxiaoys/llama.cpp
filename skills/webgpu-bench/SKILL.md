@@ -10,15 +10,15 @@ record layout, the run commands and the gates. It also owns the back half of the
 pre-check -> build -> runs -> gate -> publish.
 
 Scope: the native Dawn WebGPU backend (`ggml/src/ggml-webgpu`). The browser/wasm build, the
-`wasi:webgpu` build and every other backend are out of scope - they are different rigs with
+`wasi:webgpu` build and every other backend are out of scope - they are different targets with
 different noise and different bottlenecks. Do not mix their numbers into a WebGPU record.
 
 ## Contract (Phase 0 output)
 
 ```
-BENCHMARK:   webgpu-bench - ggml WebGPU (Dawn) backend, native, on two pinned rigs
-             (mac-arm64: Apple Silicon, linux-t4: NVIDIA T4); 3 GGUF models, 7 e2e cases
-             (pp/tg) plus a per-op microbench derived from those models' graphs
+BENCHMARK:   webgpu-bench - ggml WebGPU (Dawn) backend, native, on one pinned rig
+             (mac-arm64: Apple Silicon); 3 GGUF models, 7 e2e cases (pp/tg) plus a
+             per-op microbench derived from those models' graphs
 RECORD:      $WEBGPU_BENCH_ROOT/runs/<rig>/<YYYYMMDD>-<commit8>-<tag>/ ; accepted = status.json
              {"status":"accepted"} (or needs-review) ; not-a-base = draft, blocked, abandoned
 CASES:       summary.md (e2e: id, avg_ts per invocation, min/median/max, ref_ts) and
@@ -68,19 +68,18 @@ Three facts about this backend drive the design:
    costs more than the e2e run and measures ops no model in the set executes. Restrict it to the
    ops the benchmark models actually run.
 
-## Rigs
+## Rig
 
 | rig | machine | GPU API | Dawn | notes |
 |---|---|---|---|---|
-| `mac-arm64` | Apple Silicon, 32 GB+ | Metal via Dawn | pinned in `rigs/mac-arm64.json` | primary rig; one binary also has `MTL0`, so `ref_ts` is free |
-| `linux-t4` | NVIDIA T4 16 GB, Ubuntu | Vulkan via Dawn | same pin | CI rig; `ref_ts` only if a CUDA build is available |
+| `mac-arm64` | Apple Silicon, 32 GB+ | Metal via Dawn | pinned in `rigs/mac-arm64.json` | the only rig; the same binary also exposes `MTL0`, so `ref_ts` is free |
 
 Rules:
 
-- A record belongs to one rig. Never compare a mac record with a T4 record, and never put two rigs
-  in one aggregate.
-- Record the Dawn version, GPU driver version and OS build in `rigs/<rig>.json`. A Dawn bump is a
-  new chain: re-baseline before trusting any delta.
+- One rig, one chain. Do not add a second machine to an aggregate, and do not compare a record from
+  another machine against this chain.
+- Record the Dawn version, GPU driver version and OS build in `rigs/mac-arm64.json`. A Dawn bump is
+  a new chain: re-baseline before trusting any delta.
 - GPU timestamps are not available on every adapter. If the profile build aborts or reports 0 ms,
   mark `gpu.txt` as `unavailable` and fall back to `host.txt` plus the CPU breakdown.
 
@@ -121,8 +120,8 @@ Model selection rules, applied once and then frozen:
 - One quant the backend lists for `MUL_MAT` (Q4_0 preferred; Q8_0 or MXFP4 where the repo has no
   Q4_0).
 - One dense under 1B, one dense 3-4B, one MoE. Do not add a fourth model without a new chain.
-- Must fit the smallest rig (16 GB) and load with `GGML_SCHED_DEBUG=1` showing one split. A model
-  that splits to CPU is not a WebGPU case: replace it, do not keep it with a caveat.
+- Must fit the rig's memory and load with `GGML_SCHED_DEBUG=1` showing one split. A model that
+  splits to CPU is not a WebGPU case: replace it, do not keep it with a caveat.
 - Record repo id, resolved file path, sha256, size and quant in `meta.json`. The repo id alone is
   not a pin.
 
@@ -162,10 +161,10 @@ a finding, not noise.
 
 ### Tier C - reference gap (diagnostic only)
 
-On `mac-arm64` the same binary exposes `MTL0`. Run the same seven cases with `-dev MTL0` and store
-`ref_ts` next to `avg_ts`. Rank targets by `avg_ts / ref_ts`: the case furthest from the platform's
-own backend is where the WebGPU implementation is weakest, which is more useful than ranking by
-absolute t/s. On `linux-t4`, `ref_ts` needs a CUDA build; if it is absent the column is `n/a`.
+The same binary also exposes `MTL0`. Run the same seven cases with `-dev MTL0` and store `ref_ts`
+next to `avg_ts`. Rank targets by `avg_ts / ref_ts`: the case furthest from the platform's own
+backend is where the WebGPU implementation is weakest, which is more useful than ranking by
+absolute t/s. If the reference run is absent the column is `n/a`.
 
 `ref_ts` is never a gate. Metal and WebGPU have different kernels; the gap is a map, not a target.
 
@@ -178,10 +177,10 @@ $WEBGPU_BENCH_ROOT/
     meta.json            commit, dirty flag, Dawn, driver, OS, build configs, commands, model pins
     status.json          {"status": "draft|accepted|needs-review|blocked|abandoned", "note": ...}
     e2e/<id>-<invocation>.json
-    e2e/<id>-ref.json    optional reference backend run (MTL0 / CUDA)
+    e2e/<id>-ref.json    optional MTL0 reference run
     e2e/sched-<id>.log   GGML_SCHED_DEBUG=2, one graph per log
     e2e/load.log         first-eval "load time = ..." lines
-    e2e/rss.txt          /usr/bin/time -l (macOS) or -v (Linux) for each invocation
+    e2e/rss.txt          /usr/bin/time -l for each invocation
     e2e/ppl.txt          perplexity output for the determinism gate
     ops/perf-{1,2,3}.sql
     ops/cases.md         generated: op, params, us/run per invocation, min/median/max, noisy
@@ -328,9 +327,9 @@ Reject or rewrite a change that:
   type is fine and already exists.
 - moves work out of the timed path without paying for it. Weight preprocessing at load is allowed,
   but load time and RSS are recorded and gated.
-- tunes `command_submit_batch_size` or `max_inflight_batches` for one rig and regresses the other.
-  The code has a TODO about per-platform tuning; a general default with a measured win on both rigs
-  is fine, a constant flipped for one case is not.
+- tunes `command_submit_batch_size` or `max_inflight_batches` for one case. The code has a TODO
+  about per-platform tuning; a general default with a measured win on the whole case set is fine, a
+  constant flipped for one shape is not.
 - makes an unsupported op fall back to CPU and calls the missing GPU time a win.
 
 ## Failure modes
@@ -344,7 +343,7 @@ Reject or rewrite a change that:
 | `error: no device named '...'` | `-b` takes the device name, which is `WebGPU`, not the backend name | check `--list-devices`, do not guess |
 | every case reports `not supported` | the op list includes ops this backend does not implement | expected; compare with `docs/ops/WebGPU.csv` |
 | the op case list changed between records | the perf set is code | compare the intersection, report added/removed cases |
-| a "win" disappears on the other rig | platform-specific path (subgroup matrix, dot product) | gate on the rig that owns the chain, report the other as informational |
+| a "win" disappears on `MTL0` | platform-specific path (subgroup matrix, dot product) | fine: `ref_ts` is a map, not a gate; report it and keep the WebGPU number |
 
 ## References
 

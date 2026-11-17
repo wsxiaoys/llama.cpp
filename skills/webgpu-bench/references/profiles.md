@@ -76,12 +76,7 @@ Caveats:
 The substitute for an inclusive flamegraph, and the only way to see Dawn and the driver:
 
 ```sh
-# macOS
 sample <pid> 10 -file profile/<case>/host.txt
-
-# Linux
-perf record -g -p <pid> -- sleep 10
-perf script > profile/<case>/host.txt
 ```
 
 Use it when the CPU breakdown says `graph_compute` is large but no shader is hot: the cost is then

@@ -18,7 +18,7 @@ Selection rules:
 - Ungated repos only. A gated model makes the record unreproducible for anyone without access.
 - One dense under 1B, one dense 3-4B, one MoE. A fourth model starts a new chain, because the case
   set and therefore the aggregate change.
-- The model must fit the smallest rig (16 GB) at `-b 2048 -ub 512` and must load without falling
+- The model must fit the rig's memory at `-b 2048 -ub 512` and must load without falling
   back to CPU. Check with `GGML_SCHED_DEBUG=1`: one `## SPLIT` line means all nodes are on WebGPU.
 
 If a model cannot be pinned or splits to CPU, replace it before the first record. Do not keep it
@@ -122,6 +122,6 @@ Because of the fusions, a profile frame can be hotter than the op count suggests
 The case set is part of the measurement. Changing a model, a test length or a flag invalidates the
 comparison with earlier records, so:
 
-- a case-set change starts a new chain with a `base` record on both rigs,
+- a case-set change starts a new chain with a fresh `base` record,
 - bump a `case_set` version string in `meta.json` (for example `v1`),
 - never compare a `v2` record against a `v1` record, even on the same commit.
