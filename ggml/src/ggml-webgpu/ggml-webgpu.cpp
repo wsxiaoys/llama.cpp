@@ -1786,10 +1786,9 @@ static void ggml_webgpu_quantize_q8_dispatch_into(webgpu_context &              
         (uint32_t) src1->ne[3],
     };
 
-    std::vector<wgpu::BindGroupEntry> q8_entries = {
-        ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, src1),
-        ggml_webgpu_make_bind_group_entry(1, q8_buffer, q8_offset, q8_binding_size)
-    };
+    std::vector<wgpu::BindGroupEntry> q8_entries = { ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, src1),
+                                                     ggml_webgpu_make_bind_group_entry(1, q8_buffer, q8_offset,
+                                                                                       q8_binding_size) };
 
     auto q8_decisions = static_cast<ggml_webgpu_generic_shader_decisions *>(qq8_pipeline.context.get());
 
@@ -1921,8 +1920,7 @@ static webgpu_encoded_op ggml_webgpu_mul_mat(webgpu_context & ctx,
     if (use_mmvq) {
         entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, src0));
         if (q8_region.hit) {
-            entries.push_back(
-                ggml_webgpu_make_bind_group_entry(1, q8_region.buffer, q8_region.offset, q8_region.size));
+            entries.push_back(ggml_webgpu_make_bind_group_entry(1, q8_region.buffer, q8_region.offset, q8_region.size));
         } else {
             auto & mmvq_qq8_entry = dispatches[0].bind_group_entries[1];
             entries.push_back(ggml_webgpu_make_bind_group_entry(1, mmvq_qq8_entry.buffer, mmvq_qq8_entry.offset,
