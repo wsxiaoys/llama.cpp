@@ -353,6 +353,12 @@ static bool ggml_webgpu_fuse_norm_quant_stats_enabled() {
     return enabled;
 }
 
+// E020 pre-check counters, see GGML_WEBGPU_FUSE_NORM_ROPE_STATS in ggml_webgpu_encode.
+static bool ggml_webgpu_fuse_norm_rope_stats_enabled() {
+    static const bool enabled = std::getenv("GGML_WEBGPU_FUSE_NORM_ROPE_STATS") != nullptr;
+    return enabled;
+}
+
 // All the base objects needed to run operations on a WebGPU device
 struct webgpu_context_struct {
     // Points to global instances owned by ggml_backend_webgpu_reg_context
@@ -398,8 +404,12 @@ struct webgpu_context_struct {
     uint64_t fg_stat_matched       = 0;
 
     // E021 pre-check counters, see GGML_WEBGPU_FUSE_NORM_QUANT_STATS in ggml_webgpu_encode
-    uint64_t fn_stat_norm  = 0;
-    uint64_t fn_stat_fused = 0;
+    uint64_t fn_stat_norm   = 0;
+    uint64_t fn_stat_fused  = 0;
+    // E020 pre-check counters, see GGML_WEBGPU_FUSE_NORM_ROPE_STATS in ggml_webgpu_encode
+    uint64_t fr_stat_chain  = 0;
+    uint64_t fr_stat_fused  = 0;
+    uint64_t fr_stat_merged = 0;
 
 #ifdef GGML_WEBGPU_GPU_PROFILE
     // Profiling: per-shader GPU time in ms
@@ -3325,6 +3335,138 @@ static std::optional<webgpu_encoded_op> ggml_webgpu_rms_norm_mul(webgpu_context 
     return ggml_backend_webgpu_build(ctx, pipeline, params, entries, wg_x, wg_y);
 }
 
+// One dispatch computes the per-head QK norm chain {RMS_NORM, MUL, ROPE}: the row is reduced and
+// scaled as in ggml_webgpu_rms_norm_mul, kept in workgroup scratch and rotated in place, so the
+// ROPE dispatch and the f32 round trip of the normed row both disappear. Numerics are the existing
+// kernels' verbatim: same reduction tree, same scale, same rotation, all in f32. The matcher
+// (ggml_webgpu_can_fuse_rms_norm_mul_rope) guarantees wg_size >= ne0, so every thread owns exactly
+// one row element and the row is fully staged in scratch before the first store.
+static std::optional<webgpu_encoded_op> ggml_webgpu_rms_norm_mul_rope(webgpu_context & ctx,
+                                                                      ggml_tensor *    rn_src,
+                                                                      ggml_tensor *    rn_dst,
+                                                                      ggml_tensor *    mul_src0,
+                                                                      ggml_tensor *    mul_src1,
+                                                                      ggml_tensor *    rope_src1,
+                                                                      ggml_tensor *    dst) {
+    ggml_tensor * mul_src;
+
+    if (ggml_webgpu_tensor_equal(rn_dst, mul_src0)) {
+        mul_src = mul_src1;
+    } else if (ggml_webgpu_tensor_equal(rn_dst, mul_src1)) {
+        mul_src = mul_src0;
+    } else {
+        GGML_ABORT("rms_norm must be equal to the one of mul_src0 and mul_src1");
+    }
+
+    uint32_t offset_rn_src = (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, rn_src) / ggml_type_size(rn_src->type));
+    uint32_t offset_mul_src =
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, mul_src) / ggml_type_size(mul_src->type));
+    uint32_t offset_dst = (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, dst) / ggml_type_size(dst->type));
+    uint32_t offset_src1 =
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, rope_src1) / ggml_type_size(rope_src1->type));
+    size_t merged_offset = 0;
+    size_t merged_size   = 0;
+
+    // dst may alias rn_src: the shader stages the row before storing, but the two ranges then have
+    // to be bound as one
+    const bool src_dst_merged = ggml_webgpu_tensor_binding_overlap(ctx->global_ctx, rn_src, dst);
+    if (src_dst_merged) {
+        if (ggml_webgpu_fuse_norm_rope_stats_enabled()) {
+            ctx->fr_stat_merged += 1;
+        }
+        const ggml_webgpu_merged_binding_range merged_range =
+            ggml_webgpu_tensor_merged_binding_range(ctx, { rn_src, dst });
+        merged_offset = merged_range.offset;
+        merged_size   = merged_range.size;
+        offset_rn_src = ggml_webgpu_tensor_merged_element_offset(rn_src, merged_range);
+        offset_dst    = ggml_webgpu_tensor_merged_element_offset(dst, merged_range);
+    }
+
+    const int n_dims     = ((int32_t *) dst->op_params)[1];
+    const int mode       = ((int32_t *) dst->op_params)[2];
+    const int n_ctx_orig = ((int32_t *) dst->op_params)[4];
+
+    float freq_base;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float beta_fast;
+    float beta_slow;
+    memcpy(&freq_base, (int32_t *) dst->op_params + 5, sizeof(float));
+    memcpy(&freq_scale, (int32_t *) dst->op_params + 6, sizeof(float));
+    memcpy(&ext_factor, (int32_t *) dst->op_params + 7, sizeof(float));
+    memcpy(&attn_factor, (int32_t *) dst->op_params + 8, sizeof(float));
+    memcpy(&beta_fast, (int32_t *) dst->op_params + 9, sizeof(float));
+    memcpy(&beta_slow, (int32_t *) dst->op_params + 10, sizeof(float));
+
+    const float theta_scale = powf(freq_base, -2.0f / n_dims);
+
+    float corr_dims[2];
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, ggml_rope_get_truncate(dst),
+                             corr_dims);
+
+    std::vector<uint32_t> params = {
+        offset_rn_src,
+        offset_mul_src,
+        offset_src1,
+        offset_dst,
+        (uint32_t) (rn_src->nb[1] / ggml_type_size(rn_src->type)),
+        (uint32_t) (rn_src->nb[2] / ggml_type_size(rn_src->type)),
+        (uint32_t) (rn_src->nb[3] / ggml_type_size(rn_src->type)),
+        (uint32_t) (mul_src->nb[1] / ggml_type_size(mul_src->type)),
+        (uint32_t) (mul_src->nb[2] / ggml_type_size(mul_src->type)),
+        (uint32_t) (mul_src->nb[3] / ggml_type_size(mul_src->type)),
+        (uint32_t) (dst->nb[1] / ggml_type_size(dst->type)),
+        (uint32_t) (dst->nb[2] / ggml_type_size(dst->type)),
+        (uint32_t) (dst->nb[3] / ggml_type_size(dst->type)),
+        (uint32_t) mul_src->ne[0],
+        (uint32_t) mul_src->ne[1],
+        (uint32_t) mul_src->ne[2],
+        (uint32_t) mul_src->ne[3],
+        (uint32_t) dst->ne[0],
+        (uint32_t) dst->ne[1],
+        (uint32_t) dst->ne[2],
+        (uint32_t) dst->ne[3],
+        ggml_webgpu_u32_from_f32(ggml_get_op_params_f32(rn_dst, 0)),  // epsilon, treated as f32 in the shader
+        (uint32_t) mode,
+        ggml_webgpu_u32_from_f32(theta_scale),
+        ggml_webgpu_u32_from_f32(attn_factor),
+        ggml_webgpu_u32_from_f32(freq_scale),
+        ggml_webgpu_u32_from_f32(ext_factor),
+        ggml_webgpu_u32_from_f32(corr_dims[0]),
+        ggml_webgpu_u32_from_f32(corr_dims[1]),
+    };
+
+    std::vector<wgpu::BindGroupEntry> entries;
+    if (src_dst_merged) {
+        entries.push_back(
+            ggml_webgpu_make_bind_group_entry(0, ggml_webgpu_tensor_buf(rn_src), merged_offset, merged_size));
+    } else {
+        entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, rn_src));
+    }
+    entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, mul_src));
+    entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 2, rope_src1));
+    if (!src_dst_merged) {
+        entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 3, dst));
+    }
+
+    ggml_webgpu_shader_lib_context shader_lib_ctx = {};
+    shader_lib_ctx.src0                           = rn_src;
+    shader_lib_ctx.src1                           = mul_src;
+    shader_lib_ctx.src2                           = rope_src1;
+    shader_lib_ctx.dst                            = dst;
+    shader_lib_ctx.max_wg_size                    = ggml_webgpu_rms_norm_mul_wg_size(
+        (uint32_t) dst->ne[0], ctx->global_ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup);
+
+    webgpu_pipeline pipeline = ctx->shader_lib->get_rms_norm_mul_rope_pipeline(shader_lib_ctx, src_dst_merged);
+
+    uint32_t wg_x;
+    uint32_t wg_y;
+    compute_2d_workgroups(ggml_nrows(dst), ctx->global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension, wg_x,
+                          wg_y);
+    return ggml_backend_webgpu_build(ctx, pipeline, params, entries, wg_x, wg_y);
+}
+
 // One dispatch computes a full-width RMS_NORM+MUL row and writes its q8_1 copy straight into the
 // E001 cache slot, so the standalone norm dispatch and the f32 round trip disappear. The matcher
 // (ggml_webgpu_can_fuse_rms_norm_mul_quantize) guarantees the MUL result is a single row consumed
@@ -4032,6 +4174,71 @@ static bool ggml_webgpu_can_fuse_rms_norm_mul(const struct ggml_cgraph * cgraph,
     return true;
 }
 
+// Matches the per-head QK norm chain {RMS_NORM, MUL, ROPE}. The fused shader keeps the normed row
+// in workgroup scratch, so it needs one element per thread (wg_size >= ne0) and the rotation to
+// cover the whole row; anything else falls back to the 2-node fusion plus a separate ROPE.
+static bool ggml_webgpu_can_fuse_rms_norm_mul_rope(const struct ggml_cgraph * cgraph,
+                                                   int                        node_idx,
+                                                   webgpu_context &           ctx) {
+    if (!ggml_can_fuse(cgraph, node_idx, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE })) {
+        return false;
+    }
+
+    const ggml_tensor * rms_norm = cgraph->nodes[node_idx];
+    const ggml_tensor * mul      = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * rope     = cgraph->nodes[node_idx + 2];
+
+    // rms_norm only supports f32, and the fused shader keeps the row in f32
+    if (rms_norm->src[0]->type != GGML_TYPE_F32 || rms_norm->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (mul->src[0]->type != GGML_TYPE_F32 || mul->src[1]->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (rope->src[0] != mul || rope->type != GGML_TYPE_F32 || rope->src[1] == nullptr ||
+        rope->src[1]->type != GGML_TYPE_I32 || rope->src[2] != nullptr) {
+        return false;
+    }
+    // rms_norm shader assumes contiguous rows
+    if (!ggml_is_contiguous_rows(mul->src[0]) || !ggml_is_contiguous_rows(mul->src[1])) {
+        return false;
+    }
+
+    // only a full-head rotation with no offset: the shader rotates the row it just normed
+    const int64_t n_dims = ((const int32_t *) rope->op_params)[1];
+    const int     mode   = ((const int32_t *) rope->op_params)[2];
+    const int     n_offs = ((const int32_t *) rope->op_params)[15];
+    if (n_dims != rope->ne[0] || n_offs != 0 || (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX)) {
+        return false;
+    }
+    // one thread per rotated pair
+    if (rope->ne[0] % 2 != 0) {
+        return false;
+    }
+
+    // the normed row lives in workgroup scratch: one element per thread, and no reduction over
+    // threads that do not hold an element
+    const uint32_t wg_size = ggml_webgpu_rms_norm_mul_wg_size(
+        (uint32_t) rope->ne[0], ctx->global_ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup);
+    if (wg_size < (uint32_t) rope->ne[0]) {
+        return false;
+    }
+
+    // the fused shader binds rn_src, the norm weight and dst; overlapping bindings are only handled
+    // between rn_src and dst (as one merged range)
+    ggml_tensor * rn_src  = rms_norm->src[0];
+    ggml_tensor * mul_src = ggml_webgpu_tensor_equal(rms_norm, mul->src[0]) ? mul->src[1] : mul->src[0];
+    if (ggml_webgpu_tensor_equal(rn_src, mul_src)) {
+        return false;
+    }
+    if (ggml_webgpu_tensor_binding_overlap(ctx->global_ctx, rn_src, mul_src) ||
+        ggml_webgpu_tensor_binding_overlap(ctx->global_ctx, rope, mul_src)) {
+        return false;
+    }
+
+    return true;
+}
+
 // Matches a full-width {RMS_NORM, MUL} whose result is one row consumed only by MMVQ MUL_MATs, so
 // the norm reduction can run inside the first consumer's q8_1 quantize prologue. Tried before
 // ggml_webgpu_can_fuse_rms_norm_mul: the norm dispatch and the activation's f32 round trip both
@@ -4524,10 +4731,24 @@ static std::optional<webgpu_encoded_op> ggml_webgpu_encode(webgpu_context ctx,
             return ggml_webgpu_group_norm(ctx, src0, node);
         case GGML_OP_RMS_NORM:
             {
-                const bool fuse_norm_quant = ggml_webgpu_can_fuse_rms_norm_mul_quantize(cgraph, node_idx, ctx);
+                const bool fuse_norm_rope = ggml_webgpu_can_fuse_rms_norm_mul_rope(cgraph, node_idx, ctx);
+                const bool fuse_norm_quant =
+                    !fuse_norm_rope && ggml_webgpu_can_fuse_rms_norm_mul_quantize(cgraph, node_idx, ctx);
                 if (ggml_webgpu_fuse_norm_quant_stats_enabled()) {
                     ctx->fn_stat_norm += 1;
                     ctx->fn_stat_fused += fuse_norm_quant ? 1 : 0;
+                }
+                if (ggml_webgpu_fuse_norm_rope_stats_enabled()) {
+                    ctx->fr_stat_chain +=
+                        ggml_can_fuse(cgraph, node_idx, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE }) ? 1 : 0;
+                    ctx->fr_stat_fused += fuse_norm_rope ? 1 : 0;
+                }
+                if (fuse_norm_rope) {
+                    num_encoded_ops         = 3;
+                    ggml_tensor * mul_node  = nodes[node_idx + 1];
+                    ggml_tensor * rope_node = nodes[node_idx + 2];
+                    return ggml_webgpu_rms_norm_mul_rope(ctx, src0, node, mul_node->src[0], mul_node->src[1],
+                                                         rope_node->src[1], rope_node);
                 }
                 if (fuse_norm_quant) {
                     num_encoded_ops        = 2;
@@ -4705,6 +4926,9 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
     ctx->fg_stat_matched       = 0;
     ctx->fn_stat_norm          = 0;
     ctx->fn_stat_fused         = 0;
+    ctx->fr_stat_chain         = 0;
+    ctx->fr_stat_fused         = 0;
+    ctx->fr_stat_merged        = 0;
     if (ctx->batch_compute_passes) {
         ctx->active_compute_pass = ctx->active_command_encoder.BeginComputePass();
     }
@@ -4792,6 +5016,16 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
             fuse_norm_quant_stat_prints += 1;
             GGML_LOG_INFO("[ggml_webgpu fuse norm quant] graph: rms_norm=%llu fused=%llu\n",
                           (unsigned long long) ctx->fn_stat_norm, (unsigned long long) ctx->fn_stat_fused);
+        }
+    }
+
+    if (ggml_webgpu_fuse_norm_rope_stats_enabled() && ctx->fr_stat_chain > 0) {
+        static int fuse_norm_rope_stat_prints = 0;
+        if (fuse_norm_rope_stat_prints < 3) {
+            fuse_norm_rope_stat_prints += 1;
+            GGML_LOG_INFO("[ggml_webgpu fuse norm rope] graph: chain=%llu fused=%llu merged=%llu\n",
+                          (unsigned long long) ctx->fr_stat_chain, (unsigned long long) ctx->fr_stat_fused,
+                          (unsigned long long) ctx->fr_stat_merged);
         }
     }
 
