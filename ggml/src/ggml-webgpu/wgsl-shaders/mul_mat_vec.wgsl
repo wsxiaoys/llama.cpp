@@ -44,14 +44,23 @@ struct MulMatParams {
     limit: f32,
     pad0: u32
 #endif
+#ifdef FUSE_MULTI
+    , offset_src0_up: u32,
+    offset_dst_up: u32,
+    pad0: u32,
+    pad1: u32
+#endif
 #ifdef ADD_RESIDUAL
     , offset_residual: u32
+#ifdef FUSE_MULTI
+    , offset_residual_up: u32
+#endif
 #endif
 };
 
 #if defined(MMVQ)
 @group(0) @binding(0) var<storage, read_write> src0: array<SRC0_TYPE>;
-#ifdef FUSE_GLU
+#if defined(FUSE_GLU) || defined(FUSE_MULTI)
 @group(0) @binding(1) var<storage, read_write> src0_up: array<SRC0_TYPE>;
 @group(0) @binding(2) var<storage, read_write> src1q: array<q8_1>;
 #define DST_BINDING 3
@@ -69,11 +78,23 @@ struct MulMatParams {
 #endif
 
 @group(0) @binding(DST_BINDING) var<storage, read_write> dst: array<f32>;
-#ifdef ADD_RESIDUAL
-@group(0) @binding(DST_BINDING + 1) var<storage, read_write> residual: array<f32>;
-#define PARAMS_BINDING (DST_BINDING + 2)
+#ifdef FUSE_MULTI
+// the two matmuls of the fused pair write independent destinations
+@group(0) @binding(DST_BINDING + 1) var<storage, read_write> dst_up: array<f32>;
+#define RESIDUAL_BINDING (DST_BINDING + 2)
 #else
-#define PARAMS_BINDING (DST_BINDING + 1)
+#define RESIDUAL_BINDING (DST_BINDING + 1)
+#endif
+#ifdef ADD_RESIDUAL
+@group(0) @binding(RESIDUAL_BINDING) var<storage, read_write> residual: array<f32>;
+#ifdef FUSE_MULTI
+@group(0) @binding(RESIDUAL_BINDING + 1) var<storage, read_write> residual_up: array<f32>;
+#define PARAMS_BINDING (RESIDUAL_BINDING + 2)
+#else
+#define PARAMS_BINDING (RESIDUAL_BINDING + 1)
+#endif
+#else
+#define PARAMS_BINDING (RESIDUAL_BINDING)
 #endif
 // "mul_mat_vec_acc.tmpl" requires params.k, params.m, params.stride_01
 @group(0) @binding(PARAMS_BINDING) var<uniform> params: MulMatParams;
@@ -86,7 +107,7 @@ struct MulMatParams {
 
 // Flattened as [row][thread] to keep each row's reduction contiguous in memory.
 var<workgroup> partial_sums: array<f32, OUTPUTS_PER_WG * WG_SIZE>;
-#ifdef FUSE_GLU
+#if defined(FUSE_GLU) || defined(FUSE_MULTI)
 var<workgroup> partial_sums_up: array<f32, OUTPUTS_PER_WG * WG_SIZE>;
 #endif
 
@@ -128,18 +149,24 @@ fn main(
     let src12_idx = dst2_idx;
 
     let src0_batch_offset = params.offset_src0 + src03_idx * params.stride_03 + src02_idx * params.stride_02;
-#ifdef FUSE_GLU
+#if defined(FUSE_GLU) || defined(FUSE_MULTI)
     let src0_up_batch_offset = params.offset_src0_up + src03_idx * params.stride_03 + src02_idx * params.stride_02;
 #endif
     let dst_idx_base = params.offset_dst + dst3_idx * dst3_stride + dst2_idx * dst2_stride + row_base;
+#ifdef FUSE_MULTI
+    let dst_up_idx_base = params.offset_dst_up + dst3_idx * dst3_stride + dst2_idx * dst2_stride + row_base;
+#endif
 #ifdef ADD_RESIDUAL
     // the residual has the destination's shape and is contiguous, so it shares the linear layout
     let residual_idx_base = params.offset_residual + dst3_idx * dst3_stride + dst2_idx * dst2_stride + row_base;
+#ifdef FUSE_MULTI
+    let residual_up_idx_base = params.offset_residual_up + dst3_idx * dst3_stride + dst2_idx * dst2_stride + row_base;
+#endif
 #endif
 
 #ifdef MMVQ
     let src1q_idx_base = (src13_idx * params.bs02 * params.broadcast2 + src12_idx) * params.n * (params.k / 32u);
-#ifdef FUSE_GLU
+#if defined(FUSE_GLU) || defined(FUSE_MULTI)
     let acc_gate = accumulate_vec_q_dot(&src0, thread_id, row_base, src0_batch_offset, src1q_idx_base);
     let acc_up   = accumulate_vec_q_dot(&src0_up, thread_id, row_base, src0_up_batch_offset, src1q_idx_base);
 #else
@@ -152,7 +179,7 @@ fn main(
 
     for (var col = 0u;col < NUM_COLS;col += 1) {
 
-#ifdef FUSE_GLU
+#if defined(FUSE_GLU) || defined(FUSE_MULTI)
 #ifdef USE_SUBGROUP_REDUCTION
             for (var row = 0u; row < OUTPUTS_PER_WG; row++) {
                 let subgroup_gate = subgroupAdd(acc_gate[col][row]);
@@ -175,7 +202,21 @@ fn main(
                 let gate_total = subgroupAdd(gate_acc);
                 let up_total   = subgroupAdd(up_acc);
                 if (subgroup_invocation_id == 0) {
+#ifdef FUSE_GLU
                     dst[dst_idx_base + col * params.m + row] = glu_op(gate_total, up_total);
+#endif
+#ifdef FUSE_MULTI
+                    // each matmul keeps its own accumulation order and its own destination
+#ifdef ADD_RESIDUAL
+                    dst[dst_idx_base + col * params.m + row] =
+                        gate_total + residual[residual_idx_base + col * params.m + row];
+                    dst_up[dst_up_idx_base + col * params.m + row] =
+                        up_total + residual_up[residual_up_idx_base + col * params.m + row];
+#else
+                    dst[dst_idx_base + col * params.m + row]       = gate_total;
+                    dst_up[dst_up_idx_base + col * params.m + row] = up_total;
+#endif
+#endif
                 }
             }
 #endif
@@ -205,8 +246,23 @@ fn main(
             if (thread_id < OUTPUTS_PER_WG) {
                 let output_row = row_base + thread_id;
                 if (output_row < params.m) {
+#ifdef FUSE_GLU
                     dst[dst_idx_base + col * params.m + thread_id] =
                         glu_op(partial_sums[partial_index(thread_id, 0)], partial_sums_up[partial_index(thread_id, 0)]);
+#endif
+#ifdef FUSE_MULTI
+#ifdef ADD_RESIDUAL
+                    dst[dst_idx_base + col * params.m + thread_id] =
+                        partial_sums[partial_index(thread_id, 0)] +
+                        residual[residual_idx_base + col * params.m + thread_id];
+                    dst_up[dst_up_idx_base + col * params.m + thread_id] =
+                        partial_sums_up[partial_index(thread_id, 0)] +
+                        residual_up[residual_up_idx_base + col * params.m + thread_id];
+#else
+                    dst[dst_idx_base + col * params.m + thread_id]       = partial_sums[partial_index(thread_id, 0)];
+                    dst_up[dst_up_idx_base + col * params.m + thread_id] = partial_sums_up[partial_index(thread_id, 0)];
+#endif
+#endif
                 }
             }
 #endif

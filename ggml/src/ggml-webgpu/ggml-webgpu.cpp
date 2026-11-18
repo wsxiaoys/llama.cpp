@@ -347,6 +347,12 @@ static bool ggml_webgpu_fuse_glu_stats_enabled() {
     return enabled;
 }
 
+// E056 pre-check counters, see GGML_WEBGPU_FUSE_MULTI_STATS in ggml_webgpu_encode.
+static bool ggml_webgpu_fuse_multi_stats_enabled() {
+    static const bool enabled = std::getenv("GGML_WEBGPU_FUSE_MULTI_STATS") != nullptr;
+    return enabled;
+}
+
 // E021 pre-check counters, see GGML_WEBGPU_FUSE_NORM_QUANT_STATS in ggml_webgpu_encode.
 static bool ggml_webgpu_fuse_norm_quant_stats_enabled() {
     static const bool enabled = std::getenv("GGML_WEBGPU_FUSE_NORM_QUANT_STATS") != nullptr;
@@ -402,6 +408,10 @@ struct webgpu_context_struct {
     uint64_t fg_stat_can_fuse      = 0;
     uint64_t fg_stat_sibling_match = 0;
     uint64_t fg_stat_matched       = 0;
+
+    // E056 pre-check counters, see GGML_WEBGPU_FUSE_MULTI_STATS in ggml_webgpu_encode
+    uint64_t fm_stat_mul_mat = 0;
+    uint64_t fm_stat_matched = 0;
 
     // E021 pre-check counters, see GGML_WEBGPU_FUSE_NORM_QUANT_STATS in ggml_webgpu_encode
     uint64_t fn_stat_norm  = 0;
@@ -2284,6 +2294,117 @@ static webgpu_encoded_op ggml_webgpu_mul_mat_glu(webgpu_context & ctx,
             ggml_webgpu_make_bind_group_entry(2, mmvq_qq8_entry.buffer, mmvq_qq8_entry.offset, mmvq_qq8_entry.size));
     }
     entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 3, dst));
+
+    auto * decisions = static_cast<ggml_webgpu_mul_mat_vec_shader_decisions *>(pipeline.context.get());
+
+    const uint32_t batches       = (uint32_t) (dst->ne[2] * dst->ne[3]);
+    const uint32_t output_groups = CEIL_DIV((uint32_t) dst->ne[0], decisions->outputs_per_wg);
+    const uint32_t total_wg      = output_groups * batches;
+
+    uint32_t wg_x = 1;
+    uint32_t wg_y = 1;
+    compute_2d_workgroups(total_wg, ctx->global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension, wg_x, wg_y);
+
+    dispatches.push_back({
+        pipeline, std::move(params), std::move(entries), { wg_x, wg_y }
+    });
+
+    return ggml_backend_webgpu_build_multi(ctx, dispatches);
+}
+
+// One MMVQ dispatch that computes two sibling input projections against their shared activation and
+// writes each result to its own destination, so the activation is read once and one dispatch per
+// layer disappears. ggml_webgpu_can_fuse_mul_mat_multi guarantees the plain 2-D MMVQ mat-vec shape
+// and that the two destinations share it; the optional biases are the E010 epilogues of each matmul.
+static webgpu_encoded_op ggml_webgpu_mul_mat_multi(webgpu_context & ctx,
+                                                   ggml_tensor *    src0,
+                                                   ggml_tensor *    src0_up,
+                                                   ggml_tensor *    src1,
+                                                   ggml_tensor *    dst,
+                                                   ggml_tensor *    dst_up,
+                                                   ggml_tensor *    residual,
+                                                   ggml_tensor *    residual_up) {
+    ggml_webgpu_shader_lib_context shader_lib_ctx = {};
+
+    shader_lib_ctx.src0                     = src0;
+    shader_lib_ctx.src1                     = src1;
+    shader_lib_ctx.dst                      = dst;
+    shader_lib_ctx.max_wg_size              = ctx->global_ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup;
+    shader_lib_ctx.supports_subgroups       = ctx->global_ctx->capabilities.supports_subgroups;
+    shader_lib_ctx.supports_subgroup_matrix = ctx->global_ctx->capabilities.supports_subgroup_matrix;
+    shader_lib_ctx.sg_mat_m                 = ctx->global_ctx->capabilities.sg_mat_m;
+    shader_lib_ctx.sg_mat_n                 = ctx->global_ctx->capabilities.sg_mat_n;
+    shader_lib_ctx.sg_mat_k                 = ctx->global_ctx->capabilities.sg_mat_k;
+    shader_lib_ctx.min_subgroup_size        = ctx->global_ctx->capabilities.min_subgroup_size;
+    shader_lib_ctx.max_subgroup_size        = ctx->global_ctx->capabilities.max_subgroup_size;
+    shader_lib_ctx.supports_dot_product     = ctx->global_ctx->capabilities.supports_dot_product;
+    shader_lib_ctx.vendor                   = ctx->global_ctx->vendor;
+
+    std::vector<webgpu_dispatch_desc> dispatches;
+
+    // both projections read the same activation, so it is quantized once into the E001 cache slot
+    webgpu_q8_region q8_region = ggml_webgpu_q8_cache_acquire(ctx, src1);
+    if (!q8_region.hit) {
+        ggml_webgpu_quantize_q8_dispatch_into(ctx, src0, src1, q8_region.buffer, q8_region.offset, q8_region.size,
+                                              dispatches);
+    }
+
+    const bool add_residual = residual != nullptr;
+
+    webgpu_pipeline pipeline =
+        ctx->shader_lib->get_mul_mat_vec_pipeline(shader_lib_ctx, false, false, add_residual, true);
+
+    const uint32_t offset_src0 = (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, src0) / ggml_type_size(src0->type));
+    const uint32_t offset_src0_up =
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, src0_up) / ggml_type_size(src0_up->type));
+    const uint32_t offset_src1 = (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, src1) / ggml_type_size(src1->type));
+    const uint32_t offset_dst  = (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, dst) / ggml_type_size(dst->type));
+    const uint32_t offset_dst_up =
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, dst_up) / ggml_type_size(dst_up->type));
+
+    std::vector<uint32_t> params = {
+        offset_src0,
+        offset_src1,
+        offset_dst,
+        (uint32_t) dst->ne[0],
+        (uint32_t) dst->ne[1],
+        (uint32_t) src0->ne[0],
+        (uint32_t) (src0->nb[1] / ggml_type_size(src0->type)),
+        (uint32_t) (src1->nb[1] / ggml_type_size(src1->type)),
+        (uint32_t) (src0->nb[2] / ggml_type_size(src0->type)),
+        (uint32_t) (src1->nb[2] / ggml_type_size(src1->type)),
+        (uint32_t) (src0->nb[3] / ggml_type_size(src0->type)),
+        (uint32_t) (src1->nb[3] / ggml_type_size(src1->type)),
+        (uint32_t) src0->ne[2],
+        (uint32_t) src0->ne[3],
+        (uint32_t) (src1->ne[2] / src0->ne[2]),
+        (uint32_t) (src1->ne[3] / src0->ne[3]),
+        offset_src0_up,
+        offset_dst_up,
+        0,
+        0,
+    };
+    if (add_residual) {
+        params.push_back((uint32_t) (ggml_webgpu_tensor_misalignment(ctx, residual) / ggml_type_size(residual->type)));
+        params.push_back(
+            (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, residual_up) / ggml_type_size(residual_up->type)));
+    }
+
+    std::vector<wgpu::BindGroupEntry> entries = { ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, src0),
+                                                  ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, src0_up) };
+    if (q8_region.hit) {
+        entries.push_back(ggml_webgpu_make_bind_group_entry(2, q8_region.buffer, q8_region.offset, q8_region.size));
+    } else {
+        auto & mmvq_qq8_entry = dispatches[0].bind_group_entries[1];
+        entries.push_back(
+            ggml_webgpu_make_bind_group_entry(2, mmvq_qq8_entry.buffer, mmvq_qq8_entry.offset, mmvq_qq8_entry.size));
+    }
+    entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 3, dst));
+    entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 4, dst_up));
+    if (add_residual) {
+        entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 5, residual));
+        entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 6, residual_up));
+    }
 
     auto * decisions = static_cast<ggml_webgpu_mul_mat_vec_shader_decisions *>(pipeline.context.get());
 
@@ -4385,6 +4506,143 @@ static bool ggml_webgpu_can_fuse_mul_mat_add(const struct ggml_cgraph * cgraph, 
     return true;
 }
 
+// view-like ops the encoder already skips; the fused sibling pair may be separated by one of them
+static bool ggml_webgpu_is_view_op(enum ggml_op op) {
+    return op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
+}
+
+// Matches the V and K attention input projections: two MMVQ mat-vec matmuls that read the same
+// activation and write independent destinations, separated by the view the first output is written
+// to the KV cache with. Fusing them makes the second matmul reuse the activation the first one
+// already quantized and drops one dispatch per layer.
+//
+// The separating view is what keeps the matcher away from the sibling gate/up pair, whose outputs
+// are combined by the GLU the E014 fusion owns: there the two matmuls are adjacent.
+struct ggml_webgpu_mul_mat_multi_match {
+    ggml_tensor * src0        = nullptr;  // first projection weights (V)
+    ggml_tensor * src0_up     = nullptr;  // second projection weights (K)
+    ggml_tensor * src1        = nullptr;  // shared activation
+    ggml_tensor * dst         = nullptr;  // first projection output, after its optional bias
+    ggml_tensor * dst_up      = nullptr;  // second projection output, after its optional bias
+    ggml_tensor * residual    = nullptr;  // first projection bias, or nullptr
+    ggml_tensor * residual_up = nullptr;  // second projection bias, or nullptr
+    int           node_count  = 0;
+};
+
+static bool ggml_webgpu_can_fuse_mul_mat_multi(const struct ggml_cgraph *        cgraph,
+                                               int                               node_idx,
+                                               webgpu_context &                  ctx,
+                                               ggml_webgpu_mul_mat_multi_match & match) {
+    if (node_idx + 2 >= cgraph->n_nodes || cgraph->nodes[node_idx]->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+
+    // the first projection, plus the E010 bias epilogue when it follows
+    int           first_end      = node_idx;
+    ggml_tensor * first_residual = nullptr;
+    if (cgraph->nodes[node_idx + 1]->op == GGML_OP_ADD) {
+        if (!ggml_webgpu_can_fuse_mul_mat_add(cgraph, node_idx, ctx)) {
+            return false;
+        }
+        const ggml_tensor * add = cgraph->nodes[node_idx + 1];
+        first_residual          = add->src[0] == cgraph->nodes[node_idx] ? add->src[1] : add->src[0];
+        first_end               = node_idx + 1;
+    }
+
+    // the two projections are separated by the view the first output is written to the KV cache with
+    int idx = first_end + 1;
+    if (idx >= cgraph->n_nodes || !ggml_webgpu_is_view_op(cgraph->nodes[idx]->op)) {
+        return false;
+    }
+    while (idx < cgraph->n_nodes && ggml_webgpu_is_view_op(cgraph->nodes[idx]->op)) {
+        ++idx;
+    }
+    if (idx >= cgraph->n_nodes || cgraph->nodes[idx]->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+    const int second_mat = idx;
+
+    // the second projection, plus its own E010 bias epilogue when it follows
+    int           second_end      = second_mat;
+    ggml_tensor * second_residual = nullptr;
+    if (second_mat + 1 < cgraph->n_nodes && cgraph->nodes[second_mat + 1]->op == GGML_OP_ADD) {
+        if (!ggml_webgpu_can_fuse_mul_mat_add(cgraph, second_mat, ctx)) {
+            return false;
+        }
+        const ggml_tensor * add = cgraph->nodes[second_mat + 1];
+        second_residual         = add->src[0] == cgraph->nodes[second_mat] ? add->src[1] : add->src[0];
+        second_end              = second_mat + 1;
+    }
+
+    const ggml_tensor * first  = cgraph->nodes[node_idx];
+    const ggml_tensor * second = cgraph->nodes[second_mat];
+    ggml_tensor *       dst    = cgraph->nodes[first_end];
+    ggml_tensor *       dst_up = cgraph->nodes[second_end];
+
+    // both matmuls read the same activation and their weights are interchangeable
+    if (first->src[1] != second->src[1] || first->src[0]->type != second->src[0]->type ||
+        first->src[0]->nb[1] != second->src[0]->nb[1]) {
+        return false;
+    }
+
+    // the kernel keeps one q8_1 activation, one row stride and one destination layout for both
+    if (first->type != GGML_TYPE_F32 || second->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        dst_up->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || !ggml_is_contiguous(dst_up) ||
+        !ggml_are_same_shape(dst, dst_up) || first->src[0]->ne[2] * first->src[0]->ne[3] != 1 ||
+        second->src[0]->ne[2] * second->src[0]->ne[3] != 1 || first->src[1]->ne[2] * first->src[1]->ne[3] != 1) {
+        return false;
+    }
+
+    // both matmuls must take the MMVQ mat-vec path
+    const bool          supports_dot_product = ctx->global_ctx->capabilities.supports_dot_product;
+    const std::string & vendor               = ctx->global_ctx->vendor;
+    if (first->ne[1] > GGML_WEBGPU_MUL_MAT_VEC_MAX_ROWS || second->ne[1] > GGML_WEBGPU_MUL_MAT_VEC_MAX_ROWS ||
+        !ggml_webgpu_can_use_mmvq(first->src[0], first->src[1], first->src[1]->ne[1], supports_dot_product, vendor) ||
+        !ggml_webgpu_can_use_mmvq(second->src[0], second->src[1], second->src[1]->ne[1], supports_dot_product,
+                                  vendor)) {
+        return false;
+    }
+
+    // the fused kernel writes both destinations while reading both biases; the same-projection
+    // pairs are already checked by ggml_webgpu_can_fuse_mul_mat_add
+    if (ggml_webgpu_tensor_binding_overlap(ctx->global_ctx, dst, dst_up) ||
+        (second_residual && ggml_webgpu_tensor_binding_overlap(ctx->global_ctx, dst, second_residual)) ||
+        (first_residual && ggml_webgpu_tensor_binding_overlap(ctx->global_ctx, dst_up, first_residual))) {
+        return false;
+    }
+
+    // the fused run replaces every node from the first matmul to the second output
+    const int                 node_count = second_end - node_idx + 1;
+    std::vector<int>          node_idxs(node_count);
+    std::vector<enum ggml_op> ops(node_count);
+    for (int i = 0; i < node_count; ++i) {
+        node_idxs[i] = node_idx + i;
+        ops[i]       = cgraph->nodes[node_idx + i]->op;
+    }
+
+    // the separating views stay live for the KV cache writes, and so does the second output
+    std::vector<int> outputs;
+    for (int i = first_end - node_idx + 1; i < second_mat - node_idx; ++i) {
+        outputs.push_back(node_idx + i);
+    }
+    outputs.push_back(second_end);
+
+    if (!ggml_can_fuse_subgraph_ext(cgraph, node_idxs.data(), node_count, ops.data(), outputs.data(),
+                                    (int) outputs.size())) {
+        return false;
+    }
+
+    match.src0        = first->src[0];
+    match.src0_up     = second->src[0];
+    match.src1        = first->src[1];
+    match.dst         = dst;
+    match.dst_up      = dst_up;
+    match.residual    = first_residual;
+    match.residual_up = second_residual;
+    match.node_count  = node_count;
+    return true;
+}
+
 // Matches the build_moe_ffn expert aggregation: a MUL of the expert outputs by the router weights,
 // n_expert_used VIEWs of its expert rows and the n_expert_used-1 ADDs that sum them. The whole
 // reduction then becomes one kernel instead of 2*n_expert_used-1 dispatches.
@@ -4649,6 +4907,14 @@ static std::optional<webgpu_encoded_op> ggml_webgpu_encode(webgpu_context ctx,
         }
     }
 
+    if (ggml_webgpu_fuse_multi_stats_enabled() && node->op == GGML_OP_MUL_MAT) {
+        ggml_webgpu_mul_mat_multi_match multi_match = {};
+        ctx->fm_stat_mul_mat += 1;
+        if (ggml_webgpu_can_fuse_mul_mat_multi(cgraph, node_idx, ctx, multi_match)) {
+            ctx->fm_stat_matched += 1;
+        }
+    }
+
     switch (node->op) {
             // no-ops
         case GGML_OP_NONE:
@@ -4668,6 +4934,15 @@ static std::optional<webgpu_encoded_op> ggml_webgpu_encode(webgpu_context ctx,
         case GGML_OP_GET_ROWS:
             return ggml_webgpu_get_rows(ctx, src0, src1, node);
         case GGML_OP_MUL_MAT:
+            {
+                ggml_webgpu_mul_mat_multi_match multi_match = {};
+                if (ggml_webgpu_can_fuse_mul_mat_multi(cgraph, node_idx, ctx, multi_match)) {
+                    num_encoded_ops = multi_match.node_count;
+                    return ggml_webgpu_mul_mat_multi(ctx, multi_match.src0, multi_match.src0_up, multi_match.src1,
+                                                     multi_match.dst, multi_match.dst_up, multi_match.residual,
+                                                     multi_match.residual_up);
+                }
+            }
             if (ggml_webgpu_can_fuse_mul_mat_glu(cgraph, node_idx, ctx)) {
                 ggml_tensor * up  = nodes[node_idx + 1];
                 ggml_tensor * glu = nodes[node_idx + 2];
@@ -4901,6 +5176,8 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
     ctx->fg_stat_can_fuse      = 0;
     ctx->fg_stat_sibling_match = 0;
     ctx->fg_stat_matched       = 0;
+    ctx->fm_stat_mul_mat       = 0;
+    ctx->fm_stat_matched       = 0;
     ctx->fn_stat_norm          = 0;
     ctx->fn_stat_fused         = 0;
     ctx->fr_stat_chain         = 0;
@@ -4983,6 +5260,15 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
             GGML_LOG_INFO("[ggml_webgpu fuse glu] graph: mul_mat=%llu can_fuse=%llu sibling_match=%llu matched=%llu\n",
                           (unsigned long long) ctx->fg_stat_mul_mat, (unsigned long long) ctx->fg_stat_can_fuse,
                           (unsigned long long) ctx->fg_stat_sibling_match, (unsigned long long) ctx->fg_stat_matched);
+        }
+    }
+
+    if (ggml_webgpu_fuse_multi_stats_enabled() && ctx->fm_stat_mul_mat > 0) {
+        static int fuse_multi_stat_prints = 0;
+        if (fuse_multi_stat_prints < 3) {
+            fuse_multi_stat_prints += 1;
+            GGML_LOG_INFO("[ggml_webgpu fuse multi] graph: mul_mat=%llu matched=%llu\n",
+                          (unsigned long long) ctx->fm_stat_mul_mat, (unsigned long long) ctx->fm_stat_matched);
         }
     }
 
