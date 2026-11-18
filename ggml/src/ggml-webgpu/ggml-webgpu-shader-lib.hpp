@@ -28,6 +28,7 @@
 #define GGML_WEBGPU_KV_SEQ_PAD                       256u
 
 #define GGML_WEBGPU_ARGSORT_MERGE_MAX_WG_SIZE 512u
+#define GGML_WEBGPU_ARGSORT_MIN_WG_SIZE       32u
 #define GGML_WEBGPU_COUNT_EQUAL_WG_SIZE       256u
 
 // Matrix multiplication parameters
@@ -180,6 +181,24 @@ struct ggml_webgpu_ssm_scan_shader_decisions {
 };
 
 /** Argsort **/
+
+struct ggml_webgpu_argsort_pipeline_key {
+    int32_t  order;
+    uint32_t wg_size;
+
+    bool operator==(const ggml_webgpu_argsort_pipeline_key & other) const {
+        return order == other.order && wg_size == other.wg_size;
+    }
+};
+
+struct ggml_webgpu_argsort_pipeline_key_hash {
+    size_t operator()(const ggml_webgpu_argsort_pipeline_key & key) const {
+        size_t seed = 0;
+        ggml_webgpu_hash_combine(seed, key.order);
+        ggml_webgpu_hash_combine(seed, key.wg_size);
+        return seed;
+    }
+};
 
 struct ggml_webgpu_argsort_shader_lib_context {
     uint32_t max_wg_size;
@@ -1352,7 +1371,8 @@ class ggml_webgpu_shader_lib {
 
     std::unordered_map<int, webgpu_pipeline> sum_rows_pipelines;                // key is whether to compute the mean
     std::unordered_map<int, webgpu_pipeline> argmax_pipelines;                  // key is vec4
-    std::unordered_map<int, webgpu_pipeline> argsort_pipelines;                 // key is order
+    std::unordered_map<ggml_webgpu_argsort_pipeline_key, webgpu_pipeline, ggml_webgpu_argsort_pipeline_key_hash>
+                                             argsort_pipelines;                 // key is order/wg_size
     std::unordered_map<int, webgpu_pipeline> argsort_merge_pipelines;           // key is order
     std::unordered_map<int, webgpu_pipeline> cumsum_pipelines;                  // key is fixed, no variants yet
     std::unordered_map<int, webgpu_pipeline> arange_pipelines;                  // key is fixed, no variants yet
@@ -1748,7 +1768,18 @@ class ggml_webgpu_shader_lib {
         const int32_t order =
             is_top_k ? (int32_t) GGML_SORT_ORDER_DESC : (int32_t) ggml_get_op_params_i32(context.dst, 0);
 
-        auto it = argsort_pipelines.find(order);
+        // Size the bitonic network to the sort row: the barrier pass count is sum(log2(k)) over
+        // k = 2..WG_SIZE, so a 32-wide row sorted by a 1024-wide workgroup costs ~7x the passes.
+        uint32_t wg_size = GGML_WEBGPU_ARGSORT_MIN_WG_SIZE;
+        while (wg_size < (uint32_t) context.src0->ne[0]) {
+            wg_size <<= 1;
+        }
+        while (wg_size > context.max_wg_size || wg_size * GGML_WEBGPU_I32_SIZE_BYTES > context.wg_mem_limit_bytes / 2) {
+            wg_size >>= 1;
+        }
+
+        ggml_webgpu_argsort_pipeline_key key = { order, wg_size };
+        auto                             it  = argsort_pipelines.find(key);
         if (it != argsort_pipelines.end()) {
             return it->second;
         }
@@ -1757,18 +1788,14 @@ class ggml_webgpu_shader_lib {
         std::string              variant = "argsort";
         defines.push_back(std::string("ORDER=") + std::to_string(order));
         variant += std::string("_order") + std::to_string(order);
-        uint32_t wg_size = 1;
-        while (wg_size * 2 <= context.max_wg_size &&
-               wg_size * GGML_WEBGPU_I32_SIZE_BYTES <= context.wg_mem_limit_bytes / 2) {
-            wg_size *= 2;
-        }
         defines.push_back(std::string("WG_SIZE=") + std::to_string(wg_size));
-        auto processed                   = preprocessor.preprocess(wgsl_argsort, defines);
-        auto decisions                   = std::make_shared<ggml_webgpu_generic_shader_decisions>();
-        decisions->wg_size               = wg_size;
-        argsort_pipelines[order]         = ggml_webgpu_create_pipeline(device, processed, variant);
-        argsort_pipelines[order].context = decisions;
-        return argsort_pipelines[order];
+        variant += std::string("_wg") + std::to_string(wg_size);
+        auto processed                 = preprocessor.preprocess(wgsl_argsort, defines);
+        auto decisions                 = std::make_shared<ggml_webgpu_generic_shader_decisions>();
+        decisions->wg_size             = wg_size;
+        argsort_pipelines[key]         = ggml_webgpu_create_pipeline(device, processed, variant);
+        argsort_pipelines[key].context = decisions;
+        return argsort_pipelines[key];
     }
 
     webgpu_pipeline get_argsort_merge_pipeline(const ggml_webgpu_shader_lib_context & context) {
