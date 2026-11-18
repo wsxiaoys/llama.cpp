@@ -404,12 +404,11 @@ struct webgpu_context_struct {
     uint64_t fg_stat_matched       = 0;
 
     // E021 pre-check counters, see GGML_WEBGPU_FUSE_NORM_QUANT_STATS in ggml_webgpu_encode
-    uint64_t fn_stat_norm   = 0;
-    uint64_t fn_stat_fused  = 0;
+    uint64_t fn_stat_norm  = 0;
+    uint64_t fn_stat_fused = 0;
     // E020 pre-check counters, see GGML_WEBGPU_FUSE_NORM_ROPE_STATS in ggml_webgpu_encode
-    uint64_t fr_stat_chain  = 0;
-    uint64_t fr_stat_fused  = 0;
-    uint64_t fr_stat_merged = 0;
+    uint64_t fr_stat_chain = 0;
+    uint64_t fr_stat_fused = 0;
 
 #ifdef GGML_WEBGPU_GPU_PROFILE
     // Profiling: per-shader GPU time in ms
@@ -3358,29 +3357,13 @@ static std::optional<webgpu_encoded_op> ggml_webgpu_rms_norm_mul_rope(webgpu_con
         GGML_ABORT("rms_norm must be equal to the one of mul_src0 and mul_src1");
     }
 
-    uint32_t offset_rn_src = (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, rn_src) / ggml_type_size(rn_src->type));
-    uint32_t offset_mul_src =
+    const uint32_t offset_rn_src =
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, rn_src) / ggml_type_size(rn_src->type));
+    const uint32_t offset_mul_src =
         (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, mul_src) / ggml_type_size(mul_src->type));
-    uint32_t offset_dst = (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, dst) / ggml_type_size(dst->type));
-    uint32_t offset_src1 =
+    const uint32_t offset_dst = (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, dst) / ggml_type_size(dst->type));
+    const uint32_t offset_src1 =
         (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, rope_src1) / ggml_type_size(rope_src1->type));
-    size_t merged_offset = 0;
-    size_t merged_size   = 0;
-
-    // dst may alias rn_src: the shader stages the row before storing, but the two ranges then have
-    // to be bound as one
-    const bool src_dst_merged = ggml_webgpu_tensor_binding_overlap(ctx->global_ctx, rn_src, dst);
-    if (src_dst_merged) {
-        if (ggml_webgpu_fuse_norm_rope_stats_enabled()) {
-            ctx->fr_stat_merged += 1;
-        }
-        const ggml_webgpu_merged_binding_range merged_range =
-            ggml_webgpu_tensor_merged_binding_range(ctx, { rn_src, dst });
-        merged_offset = merged_range.offset;
-        merged_size   = merged_range.size;
-        offset_rn_src = ggml_webgpu_tensor_merged_element_offset(rn_src, merged_range);
-        offset_dst    = ggml_webgpu_tensor_merged_element_offset(dst, merged_range);
-    }
 
     const int n_dims     = ((int32_t *) dst->op_params)[1];
     const int mode       = ((int32_t *) dst->op_params)[2];
@@ -3437,18 +3420,12 @@ static std::optional<webgpu_encoded_op> ggml_webgpu_rms_norm_mul_rope(webgpu_con
         ggml_webgpu_u32_from_f32(corr_dims[1]),
     };
 
-    std::vector<wgpu::BindGroupEntry> entries;
-    if (src_dst_merged) {
-        entries.push_back(
-            ggml_webgpu_make_bind_group_entry(0, ggml_webgpu_tensor_buf(rn_src), merged_offset, merged_size));
-    } else {
-        entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, rn_src));
-    }
-    entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, mul_src));
-    entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 2, rope_src1));
-    if (!src_dst_merged) {
-        entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 3, dst));
-    }
+    std::vector<wgpu::BindGroupEntry> entries = {
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, rn_src),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, mul_src),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 2, rope_src1),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 3, dst),
+    };
 
     ggml_webgpu_shader_lib_context shader_lib_ctx = {};
     shader_lib_ctx.src0                           = rn_src;
@@ -3458,7 +3435,7 @@ static std::optional<webgpu_encoded_op> ggml_webgpu_rms_norm_mul_rope(webgpu_con
     shader_lib_ctx.max_wg_size                    = ggml_webgpu_rms_norm_mul_wg_size(
         (uint32_t) dst->ne[0], ctx->global_ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup);
 
-    webgpu_pipeline pipeline = ctx->shader_lib->get_rms_norm_mul_rope_pipeline(shader_lib_ctx, src_dst_merged);
+    webgpu_pipeline pipeline = ctx->shader_lib->get_rms_norm_mul_rope_pipeline(shader_lib_ctx);
 
     uint32_t wg_x;
     uint32_t wg_y;
@@ -4224,15 +4201,15 @@ static bool ggml_webgpu_can_fuse_rms_norm_mul_rope(const struct ggml_cgraph * cg
         return false;
     }
 
-    // the fused shader binds rn_src, the norm weight and dst; overlapping bindings are only handled
-    // between rn_src and dst (as one merged range)
+    // the fused shader binds rn_src, the norm weight and dst as three separate ranges
     ggml_tensor * rn_src  = rms_norm->src[0];
     ggml_tensor * mul_src = ggml_webgpu_tensor_equal(rms_norm, mul->src[0]) ? mul->src[1] : mul->src[0];
     if (ggml_webgpu_tensor_equal(rn_src, mul_src)) {
         return false;
     }
     if (ggml_webgpu_tensor_binding_overlap(ctx->global_ctx, rn_src, mul_src) ||
-        ggml_webgpu_tensor_binding_overlap(ctx->global_ctx, rope, mul_src)) {
+        ggml_webgpu_tensor_binding_overlap(ctx->global_ctx, rope, mul_src) ||
+        ggml_webgpu_tensor_binding_overlap(ctx->global_ctx, rn_src, rope)) {
         return false;
     }
 
@@ -4928,7 +4905,6 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
     ctx->fn_stat_fused         = 0;
     ctx->fr_stat_chain         = 0;
     ctx->fr_stat_fused         = 0;
-    ctx->fr_stat_merged        = 0;
     if (ctx->batch_compute_passes) {
         ctx->active_compute_pass = ctx->active_command_encoder.BeginComputePass();
     }
@@ -5023,9 +4999,8 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
         static int fuse_norm_rope_stat_prints = 0;
         if (fuse_norm_rope_stat_prints < 3) {
             fuse_norm_rope_stat_prints += 1;
-            GGML_LOG_INFO("[ggml_webgpu fuse norm rope] graph: chain=%llu fused=%llu merged=%llu\n",
-                          (unsigned long long) ctx->fr_stat_chain, (unsigned long long) ctx->fr_stat_fused,
-                          (unsigned long long) ctx->fr_stat_merged);
+            GGML_LOG_INFO("[ggml_webgpu fuse norm rope] graph: chain=%llu fused=%llu\n",
+                          (unsigned long long) ctx->fr_stat_chain, (unsigned long long) ctx->fr_stat_fused);
         }
     }
 

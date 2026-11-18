@@ -2,8 +2,7 @@
 //
 // One workgroup per row and WG_SIZE >= ne0, so every thread owns exactly one element of the row:
 // the normed row is staged in scratch and the rotation reads its pair from there, so the row never
-// round-trips through global memory. The row is fully staged before anything is written, which also
-// makes the fused dispatch safe when dst aliases rn_src (SRC_DST_MERGED).
+// round-trips through global memory.
 //
 // Guards enforced by ggml_webgpu_can_fuse_rms_norm_mul_rope: f32/contiguous-rows operands,
 // rope->src[2] == nullptr, n_dims == ne0, n_offs == 0, mode in {NORMAL, NEOX}, ne0 even and
@@ -48,18 +47,8 @@ struct Params {
     corr_dim1: f32
 };
 
-#ifdef SRC_DST_MERGED
-
-// rn_src and dst overlap in one binding; both offsets are relative to the merged range
-@group(0) @binding(0)
-var<storage, read_write> src_dst: array<f32>;
-
-#else
-
 @group(0) @binding(0)
 var<storage, read_write> rn_src: array<f32>;
-
-#endif
 
 @group(0) @binding(1)
 var<storage, read_write> mul_src: array<f32>;
@@ -67,42 +56,13 @@ var<storage, read_write> mul_src: array<f32>;
 @group(0) @binding(2)
 var<storage, read_write> pos: array<i32>;
 
-#ifndef SRC_DST_MERGED
-
 @group(0) @binding(3)
 var<storage, read_write> dst: array<f32>;
-
-#endif
-
-#ifdef SRC_DST_MERGED
-
-@group(0) @binding(3)
-var<uniform> params: Params;
-
-#else
 
 @group(0) @binding(4)
 var<uniform> params: Params;
 
-#endif
-
 var<workgroup> scratch: array<f32, WG_SIZE>;
-
-fn load_rn(i: u32) -> f32 {
-#ifdef SRC_DST_MERGED
-    return src_dst[i];
-#else
-    return rn_src[i];
-#endif
-}
-
-fn store_dst(i: u32, v: f32) {
-#ifdef SRC_DST_MERGED
-    src_dst[i] = v;
-#else
-    dst[i] = v;
-#endif
-}
 
 // verbatim from rope.wgsl
 fn rope_yarn_ramp(low: f32, high: f32, i: u32) -> f32 {
@@ -143,7 +103,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     // one element per thread: wg_size >= ne0
     var sum = 0.0f;
     if (lid.x < params.ne0) {
-        sum = pow(load_rn(i_rn_src_row + lid.x), 2.0);
+        sum = pow(rn_src[i_rn_src_row + lid.x], 2.0);
     }
     scratch[lid.x] = sum;
 
@@ -164,7 +124,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     let scale = 1.0/sqrt(sum/f32(params.ne0) + params.eps);
 
     if (lid.x < params.ne0) {
-        scratch[lid.x] = scale * load_rn(i_rn_src_row + lid.x) * mul_src[i_mul_src_row + lid.x % params.mul_src_ne0];
+        scratch[lid.x] = scale * rn_src[i_rn_src_row + lid.x] * mul_src[i_mul_src_row + lid.x % params.mul_src_ne0];
     }
     workgroupBarrier();
 
@@ -182,6 +142,6 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     let i_pair = select(i0, lid.x, is_neox);
     let x0 = scratch[i_pair];
     let x1 = scratch[i_pair + pair_offset];
-    store_dst(i_dst_row + i_pair, x0 * thetas.x - x1 * thetas.y);
-    store_dst(i_dst_row + i_pair + pair_offset, x0 * thetas.y + x1 * thetas.x);
+    dst[i_dst_row + i_pair] = x0 * thetas.x - x1 * thetas.y;
+    dst[i_dst_row + i_pair + pair_offset] = x0 * thetas.y + x1 * thetas.x;
 }

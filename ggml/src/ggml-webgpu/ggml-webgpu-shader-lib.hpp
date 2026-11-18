@@ -345,26 +345,17 @@ struct ggml_webgpu_rms_norm_mul_shader_decisions {
 /** RMS_NORM + MUL + ROPE **/
 
 struct ggml_webgpu_rms_norm_mul_rope_pipeline_key {
-    bool     src_dst_merged;  // rn_src and dst overlap, so they share one binding
-    uint32_t wg_size;         // workgroup width, chosen from the row length
+    uint32_t wg_size;  // workgroup width, chosen from the row length
 
-    bool operator==(const ggml_webgpu_rms_norm_mul_rope_pipeline_key & other) const {
-        return src_dst_merged == other.src_dst_merged && wg_size == other.wg_size;
-    }
+    bool operator==(const ggml_webgpu_rms_norm_mul_rope_pipeline_key & other) const { return wg_size == other.wg_size; }
 };
 
 struct ggml_webgpu_rms_norm_mul_rope_pipeline_key_hash {
     size_t operator()(const ggml_webgpu_rms_norm_mul_rope_pipeline_key & key) const {
         size_t seed = 0;
-        ggml_webgpu_hash_combine(seed, key.src_dst_merged);
         ggml_webgpu_hash_combine(seed, key.wg_size);
         return seed;
     }
-};
-
-struct ggml_webgpu_rms_norm_mul_rope_shader_decisions {
-    uint32_t wg_size        = 0;
-    bool     src_dst_merged = false;
 };
 
 /** Pad **/
@@ -3067,10 +3058,8 @@ class ggml_webgpu_shader_lib {
         return rms_norm_mul_pipelines[key];
     }
 
-    webgpu_pipeline get_rms_norm_mul_rope_pipeline(const ggml_webgpu_shader_lib_context & context,
-                                                   bool                                   src_dst_merged) {
+    webgpu_pipeline get_rms_norm_mul_rope_pipeline(const ggml_webgpu_shader_lib_context & context) {
         ggml_webgpu_rms_norm_mul_rope_pipeline_key key = {};
-        key.src_dst_merged                             = src_dst_merged;
         key.wg_size                                    = context.max_wg_size;
 
         auto it = rms_norm_mul_rope_pipelines.find(key);
@@ -3081,20 +3070,14 @@ class ggml_webgpu_shader_lib {
         std::vector<std::string> defines;
         std::string              variant = "RMS_NORM_MUL_ROPE";
 
-        if (key.src_dst_merged) {
-            defines.push_back("SRC_DST_MERGED");
-            variant += "_src_dst_merged";
-        }
-
         defines.push_back(std::string("WG_SIZE=") + std::to_string(key.wg_size));
 
-        auto processed                     = preprocessor.preprocess(wgsl_rms_norm_mul_rope, defines);
-        auto pipeline_decisions            = std::make_shared<ggml_webgpu_rms_norm_mul_rope_shader_decisions>();
-        pipeline_decisions->wg_size        = key.wg_size;
-        pipeline_decisions->src_dst_merged = key.src_dst_merged;
-        webgpu_pipeline pipeline           = ggml_webgpu_create_pipeline(device, processed, variant);
-        pipeline.context                   = pipeline_decisions;
-        rms_norm_mul_rope_pipelines[key]   = pipeline;
+        auto processed                   = preprocessor.preprocess(wgsl_rms_norm_mul_rope, defines);
+        auto decisions                   = std::make_shared<ggml_webgpu_generic_shader_decisions>();
+        decisions->wg_size               = key.wg_size;
+        webgpu_pipeline pipeline         = ggml_webgpu_create_pipeline(device, processed, variant);
+        pipeline.context                 = decisions;
+        rms_norm_mul_rope_pipelines[key] = pipeline;
         return rms_norm_mul_rope_pipelines[key];
     }
 
