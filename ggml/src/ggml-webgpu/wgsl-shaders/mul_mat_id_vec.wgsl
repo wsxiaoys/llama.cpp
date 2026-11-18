@@ -24,6 +24,11 @@ struct MulMatIdVecParams {
     stride_11: u32,
     stride_02: u32,
     stride_12: u32,
+
+#ifdef ADD_ID_BIAS
+    offset_bias: u32,
+    bias_stride: u32,
+#endif
 };
 
 @group(0) @binding(0) var<storage, read_write> src0: array<SRC0_TYPE>; // [cols, rows, n_expert]
@@ -31,8 +36,30 @@ struct MulMatIdVecParams {
 @group(0) @binding(2) var<storage, read_write> ids: array<u32>;        // [n_experd_used, n_tokens(1)]
 @group(0) @binding(3) var<storage, read_write> dst: array<f32>;   // [rows, n_expert_used, n_tokens(1)]
 
+#ifdef ADD_ID_BIAS
+@group(0) @binding(4) var<storage, read_write> bias: array<f32>;  // [rows, n_expert]
+
+// "mul_mat_vec_acc.tmpl" requires params.k, params.m, params.stride_01
+@group(0) @binding(5) var<uniform> params: MulMatIdVecParams;
+#else
 // "mul_mat_vec_acc.tmpl" requires params.k, params.m, params.stride_01
 @group(0) @binding(4) var<uniform> params: MulMatIdVecParams;
+#endif
+
+// the fused ADD_ID epilogue adds bias[own_expert][row]; a skipped slot (id -1) keeps the matmul
+// result untouched, matching add_id.wgsl
+#ifdef ADD_ID_BIAS
+fn add_expert_bias(acc: f32, expert: u32, row: u32, skipped: bool) -> f32 {
+    if (skipped) {
+        return acc;
+    }
+    return acc + bias[params.offset_bias + expert * params.bias_stride + row];
+}
+#else
+fn add_expert_bias(acc: f32, _expert: u32, _row: u32, _skipped: bool) -> f32 {
+    return acc;
+}
+#endif
 
 // Flattened as [row][thread] to keep each row's reduction contiguous in memory.
 var<workgroup> partial_sums: array<f32, OUTPUTS_PER_WG * WG_SIZE>;
@@ -101,7 +128,7 @@ fn main(
         }
         let row_total = subgroupAdd(row_acc);
         if (subgroup_invocation_id == 0) {
-            dst[dst_idx_base + row] = row_total;
+            dst[dst_idx_base + row] = add_expert_bias(row_total, own_expert, output_row, skipped);
         }
     }
 #endif
@@ -129,7 +156,8 @@ fn main(
     if (thread_id < OUTPUTS_PER_WG) {
         let output_row = row_base + thread_id;
         if (output_row < params.m) {
-            dst[dst_idx_base + thread_id] = partial_sums[partial_index(thread_id, 0)];
+            dst[dst_idx_base + thread_id] =
+                add_expert_bias(partial_sums[partial_index(thread_id, 0)], own_expert, output_row, skipped);
         }
     }
 #endif

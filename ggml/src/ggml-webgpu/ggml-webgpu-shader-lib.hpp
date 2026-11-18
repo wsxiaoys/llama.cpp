@@ -104,6 +104,7 @@ struct ggml_webgpu_shader_lib_context {
     uint32_t    min_subgroup_size        = 0;
     uint32_t    max_subgroup_size        = 0;
     bool        supports_dot_product     = false;
+    bool        mul_mat_id_bias          = false;
     std::string vendor;
 };
 
@@ -1168,11 +1169,12 @@ struct ggml_webgpu_mul_mat_id_pipeline_key {
     uint32_t  num_cols;
     int       vectorized;
     int       use_subgroup_matrix;
+    int       use_bias;
 
     bool operator==(const ggml_webgpu_mul_mat_id_pipeline_key & other) const {
         return src0_type == other.src0_type && src1_type == other.src1_type && n_experts == other.n_experts &&
                num_cols == other.num_cols && vectorized == other.vectorized &&
-               use_subgroup_matrix == other.use_subgroup_matrix;
+               use_subgroup_matrix == other.use_subgroup_matrix && use_bias == other.use_bias;
     }
 };
 
@@ -1185,6 +1187,7 @@ struct ggml_webgpu_mul_mat_id_pipeline_key_hash {
         ggml_webgpu_hash_combine(seed, key.num_cols);
         ggml_webgpu_hash_combine(seed, key.vectorized);
         ggml_webgpu_hash_combine(seed, key.use_subgroup_matrix);
+        ggml_webgpu_hash_combine(seed, key.use_bias);
         return seed;
     }
 };
@@ -2820,6 +2823,7 @@ class ggml_webgpu_shader_lib {
                           (context.src0->type == GGML_TYPE_F32 || context.src0->type == GGML_TYPE_F16)) ?
                              1 :
                              0;
+        key.use_bias   = context.mul_mat_id_bias ? 1 : 0;
 
         auto it = mul_mat_id_vec_pipelines.find(key);
         if (it != mul_mat_id_vec_pipelines.end()) {
@@ -2931,6 +2935,9 @@ class ggml_webgpu_shader_lib {
         defines.push_back(std::string("NUM_COLS=1"));
 
         defines.push_back(std::string("N_EXPERTS=") + std::to_string(key.n_experts));
+        if (key.use_bias) {
+            defines.push_back("ADD_ID_BIAS");
+        }
 
         auto processed = preprocessor.preprocess(shader_src, defines);
 
