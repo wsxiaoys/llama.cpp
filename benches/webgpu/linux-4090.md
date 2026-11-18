@@ -17,19 +17,24 @@ Rig: NVIDIA GeForce RTX 4090, Linux 6.8.0-149-generic x86_64, driver 595.91.07, 
 | 2026-11-17 | 82c1c25f | E029-rmsnorm-reduce-full | 757.69 | 8778.96 | 120.42 | +2.9% |
 | 2026-11-17 | 3fefab7a | E021-norm-quantize-full | 777.73 | 8837.80 | 125.66 | +2.6% |
 | 2026-11-17 | 781e2278 | E022-moe-weighted-reduce-full | 793.30 | 8933.01 | 128.95 | +2.0% |
+| 2026-11-17 | a694a4a1 | E031-split-k-shape-budget-full | 805.17 | 9275.22 | 128.77 | +1.5% |
+| 2026-11-17 | d0fb6410 | E038-param-coalesce-full | 877.94 | 9344.57 | 148.99 | +9.0% |
+| 2026-11-18 | b83d1e2a | E040-bindgroup-memo-full | 944.90 | 9262.45 | 170.56 | +7.6% |
+| 2026-11-18 | 954911c2 | E020-qknorm-rope-full-clean | 957.58 | 9291.70 | 173.08 | +1.3% |
+| 2026-11-18 | a670ca20 | E013-moe-addid-full | 958.07 | 9287.79 | 174.39 | +0.1% |
 
 ## base -> latest (per case)
 
 | id | case | base ts | latest ts | delta |
 |---|---|---|---|---|
-| a1 | smallest dense prefill | 10923.20 | 25803.51 | +136.2% |
-| a2 | smallest dense decode | 116.75 | 156.59 | +34.1% |
-| a3 | mid dense prefill | 4149.12 | 7112.88 | +71.4% |
-| a4 | mid dense decode | 88.88 | 131.04 | +47.4% |
-| a5 | MoE prefill | 908.54 | 3884.72 | +327.6% |
-| a6 | MoE decode | 80.60 | 108.99 | +35.2% |
-| g1 | long-KV guard | 86.28 | 124.28 | +44.0% |
-| **G** | geomean over cases | 434.60 | 793.30 | +82.5% |
+| a1 | smallest dense prefill | 10923.20 | 27446.07 | +151.3% |
+| a2 | smallest dense decode | 116.75 | 258.35 | +121.3% |
+| a3 | mid dense prefill | 4149.12 | 7325.65 | +76.6% |
+| a4 | mid dense decode | 88.88 | 186.61 | +110.0% |
+| a5 | MoE prefill | 908.54 | 3985.35 | +338.7% |
+| a6 | MoE decode | 80.60 | 128.76 | +59.8% |
+| g1 | long-KV guard | 86.28 | 148.65 | +72.3% |
+| **G** | geomean over cases | 434.60 | 958.07 | +120.4% |
 
 ## case set (models)
 
@@ -45,34 +50,34 @@ Rig: NVIDIA GeForce RTX 4090, Linux 6.8.0-149-generic x86_64, driver 595.91.07, 
 
 ## latest
 
-commit 781e2278, case_set v1, dawn v20260908.214631 / 94c3c9c, driver 595.91.07, dirty: no
+commit a670ca20, case_set v1, dawn v20260908.214631 / 94c3c9c, driver 595.91.07, dirty: no
 
 | id | case | ts run1 | ts run2 | ts run3 | median | noise | ref_ts | ts/ref |
 |---|---|---|---|---|---|---|---|---|
-| a1 | smallest dense prefill | 24769.25 | 25803.51 | 25844.56 | 25803.51 | 4.2% | n/a | n/a |
-| a2 | smallest dense decode | 157.61 | 156.51 | 156.59 | 156.59 | 0.7% | n/a | n/a |
-| a3 | mid dense prefill | 7112.88 | 7121.42 | 7104.78 | 7112.88 | 0.2% | n/a | n/a |
-| a4 | mid dense decode | 131.91 | 131.04 | 131.02 | 131.04 | 0.7% | n/a | n/a |
-| a5 | MoE prefill | 3884.72 | 3891.42 | 3882.16 | 3884.72 | 0.2% | n/a | n/a |
-| a6 | MoE decode | 106.78 | 109.08 | 108.99 | 108.99 | 2.1% | n/a | n/a |
-| g1 | long-KV guard | 124.28 | 123.60 | 124.38 | 124.28 | 0.6% | n/a | n/a |
+| a1 | smallest dense prefill | 27498.52 | 27446.07 | 27373.06 | 27446.07 | 0.5% | n/a | n/a |
+| a2 | smallest dense decode | 258.19 | 258.50 | 258.35 | 258.35 | 0.1% | n/a | n/a |
+| a3 | mid dense prefill | 7348.34 | 7324.71 | 7325.65 | 7325.65 | 0.3% | n/a | n/a |
+| a4 | mid dense decode | 186.61 | 186.61 | 186.57 | 186.61 | 0.0% | n/a | n/a |
+| a5 | MoE prefill | 3981.53 | 3985.35 | 3995.47 | 3985.35 | 0.3% | n/a | n/a |
+| a6 | MoE decode | 130.53 | 128.34 | 128.76 | 128.76 | 1.7% | n/a | n/a |
+| g1 | long-KV guard | 148.30 | 149.37 | 148.65 | 148.65 | 0.7% | n/a | n/a |
 
-G = 793.30   G_pp = 8933.01   G_tg = 128.95
-G range over invocations: [788.10, 793.61]
-noise_agg = 0.7%
+G = 958.07   G_pp = 9287.79   G_tg = 174.39
+G range over invocations: [957.74, 959.80]
+noise_agg = 0.2%
 
-ops: 485 / 514 cases, W = 424.5 us
-ppl = 9.8406 (corpus 173c87a5)
+ops: 485 / 514 cases, W = 398.0 us
+ppl = 9.8355 (corpus 173c87a5)
 peak rss = 22828 MiB
-load time = 10361 ms
+load time = 11261 ms
 
 ## profile top shaders
 
-- a1: mul_mat_subgroup_matrix_q8_0_f32_split4 24.4 ms (58.6%), flash_attn_kf16_vf16_qf32_dstf32_mask_k_direct_v_direct_hsqk128_hsv128 5.7 ms (13.6%), mul_mat_split_k_reduce 3.8 ms (9.1%)
-- a2: mul_mat_vec_q8_0_f32_sg_reduce 119.5 ms (18.5%), flash_attn_vec_kf16_vf16_qf32_dstf32_mask_k_direct_v_direct_hsqk128_h_mask_blk_dsplit4 90.4 ms (14.0%), mul_mat_vec_q8_0_f32_add_residual_sg_reduce 74.2 ms (11.5%)
-- a3: mul_mat_subgroup_matrix_q4_0_f32 57.0 ms (42.3%), mul_mat_subgroup_matrix_q4_0_f32_split4 53.8 ms (39.9%), flash_attn_kf16_vf16_qf32_dstf32_mask_k_direct_v_direct_hsqk128_hsv128 7.3 ms (5.4%)
-- a4: mul_mat_vec_q4_0_f32_add_residual_sg_reduce 264.7 ms (28.6%), mul_mat_vec_q4_0_f32_fuse_OP_SWIGLU_sg_reduce 175.5 ms (18.9%), flash_attn_vec_kf16_vf16_qf32_dstf32_mask_k_direct_v_direct_hsqk128_h_mask_blk_dsplit4 111.0 ms (12.0%)
-- a5: mul_mat_id_subgroup_matrix_mxfp4_f32 360.5 ms (72.4%), mul_mat_subgroup_matrix_q8_0_f32_split4 36.2 ms (7.3%), mul_mat_subgroup_matrix_q8_0_f32_split2 22.0 ms (4.4%)
-- a6: mul_mat_id_vec_mxfp4_f32_sg_reduce 459.7 ms (33.3%), mul_mat_vec_q8_0_f32_add_residual_sg_reduce 235.2 ms (17.1%), mul_mat_vec_q8_0_f32_sg_reduce 104.1 ms (7.5%)
-- g1: mul_mat_vec_q4_0_f32_add_residual_sg_reduce 264.1 ms (15.9%), mul_mat_subgroup_matrix_q4_0_f32 223.2 ms (13.4%), mul_mat_subgroup_matrix_q4_0_f32_split4 210.4 ms (12.7%)
+- a1: mul_mat_subgroup_matrix_q8_0_f32_split8 10.6 ms (28.8%), mul_mat_subgroup_matrix_q8_0_f32_split4 9.9 ms (26.6%), flash_attn_kf16_vf16_qf32_dstf32_mask_k_direct_v_direct_hsqk128_hsv128 5.6 ms (15.2%)
+- a2: mul_mat_vec_q8_0_f32_sg_reduce 119.7 ms (19.9%), flash_attn_vec_kf16_vf16_qf32_dstf32_mask_k_direct_v_direct_hsqk128_h_mask_blk_dsplit4 89.8 ms (14.9%), mul_mat_vec_q8_0_f32_add_residual_sg_reduce 74.5 ms (12.4%)
+- a3: mul_mat_subgroup_matrix_q4_0_f32 57.8 ms (43.7%), mul_mat_subgroup_matrix_q4_0_f32_split4 44.0 ms (33.3%), flash_attn_kf16_vf16_qf32_dstf32_mask_k_direct_v_direct_hsqk128_hsv128 7.4 ms (5.6%)
+- a4: mul_mat_vec_q4_0_f32_add_residual_sg_reduce 264.7 ms (28.6%), mul_mat_vec_q4_0_f32_fuse_OP_SWIGLU_sg_reduce 175.6 ms (18.9%), flash_attn_vec_kf16_vf16_qf32_dstf32_mask_k_direct_v_direct_hsqk128_h_mask_blk_dsplit4 111.4 ms (12.0%)
+- a5: mul_mat_id_subgroup_matrix_mxfp4_f32 279.8 ms (72.4%), flash_attn_kf16_vf16_qf32_dstf32_mask_sinks_k_direct_v_direct_hsqk64_hsv64 19.2 ms (5.0%), mul_mat_subgroup_matrix_q8_0_f32_split2 17.8 ms (4.6%)
+- a6: mul_mat_id_vec_mxfp4_f32_sg_reduce 507.4 ms (35.6%), mul_mat_vec_q8_0_f32_add_residual_sg_reduce 257.7 ms (18.1%), mul_mat_vec_q8_0_f32_sg_reduce 125.3 ms (8.8%)
+- g1: mul_mat_vec_q4_0_f32_add_residual_sg_reduce 264.4 ms (16.0%), mul_mat_subgroup_matrix_q4_0_f32 223.4 ms (13.6%), flash_attn_vec_kf16_vf16_qf32_dstf32_mask_k_direct_v_direct_hsqk128_h_mask_blk_dsplit4 200.8 ms (12.2%)
 
