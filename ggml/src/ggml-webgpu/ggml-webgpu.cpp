@@ -2302,11 +2302,14 @@ static webgpu_encoded_op ggml_webgpu_mul_mat_glu(webgpu_context & ctx,
     return ggml_backend_webgpu_build_multi(ctx, dispatches);
 }
 
+// bias != nullptr folds a following ADD_ID into this dispatch: dst is then the ADD_ID node and
+// bias is its src[1] ([rows, n_expert], f32 contiguous).
 static webgpu_encoded_op ggml_webgpu_mul_mat_id_vec(webgpu_context & ctx,
                                                     ggml_tensor *    src0,
                                                     ggml_tensor *    src1,
                                                     ggml_tensor *    src2,
-                                                    ggml_tensor *    dst) {
+                                                    ggml_tensor *    dst,
+                                                    ggml_tensor *    bias) {
     const uint32_t param_n_expert      = (uint32_t) src0->ne[2];
     const uint32_t param_n_expert_used = (uint32_t) dst->ne[1];
 
@@ -2316,6 +2319,7 @@ static webgpu_encoded_op ggml_webgpu_mul_mat_id_vec(webgpu_context & ctx,
     shader_lib_ctx.src2                           = src2;
     shader_lib_ctx.dst                            = dst;
     shader_lib_ctx.supports_subgroups             = ctx->global_ctx->capabilities.supports_subgroups;
+    shader_lib_ctx.mul_mat_id_bias                = bias != nullptr;
     shader_lib_ctx.max_wg_size = ctx->global_ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup;
 
     webgpu_pipeline pipeline = ctx->shader_lib->get_mul_mat_id_vec_pipeline(shader_lib_ctx);
@@ -2346,6 +2350,12 @@ static webgpu_encoded_op ggml_webgpu_mul_mat_id_vec(webgpu_context & ctx,
         ggml_webgpu_make_bind_group_entry(3, ggml_webgpu_tensor_buf(dst), ggml_webgpu_tensor_align_offset(ctx, dst),
                                           ggml_webgpu_tensor_binding_size(ctx, dst)),
     };
+
+    if (bias != nullptr) {
+        params.push_back((uint32_t) (ggml_webgpu_tensor_misalignment(ctx, bias) / ggml_type_size(bias->type)));
+        params.push_back((uint32_t) (bias->nb[1] / ggml_type_size(bias->type)));
+        entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 4, bias));
+    }
 
     uint32_t wg_x = 1;
     uint32_t wg_y = 1;
@@ -2391,7 +2401,7 @@ static webgpu_encoded_op ggml_webgpu_mul_mat_id(webgpu_context & ctx,
                                                 ggml_tensor *    dst) {
     // we can use mat-vec fast path
     if (dst->ne[2] == 1) {
-        return ggml_webgpu_mul_mat_id_vec(ctx, src0, src1, src2, dst);
+        return ggml_webgpu_mul_mat_id_vec(ctx, src0, src1, src2, dst, nullptr);
     }
 
     ggml_webgpu_shader_lib_context shader_lib_ctx = {};
@@ -4385,6 +4395,44 @@ static bool ggml_webgpu_can_fuse_mul_mat_add(const struct ggml_cgraph * cgraph, 
     return true;
 }
 
+// Matches a single-use MUL_MAT_ID (mat-vec path, one token) followed by the ADD_ID that adds the
+// per-expert bias, so the bias fold removes the ADD_ID dispatch and the intermediate round trip.
+static bool ggml_webgpu_can_fuse_mul_mat_id_add_id(const struct ggml_cgraph * cgraph,
+                                                   int                        node_idx,
+                                                   webgpu_context &           ctx) {
+    if (!ggml_can_fuse(cgraph, node_idx, { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID })) {
+        return false;
+    }
+
+    const ggml_tensor * mul = cgraph->nodes[node_idx];
+    const ggml_tensor * add = cgraph->nodes[node_idx + 1];
+
+    // the epilogue is wired into the mat-vec path only (one token per call)
+    if (mul->ne[2] != 1) {
+        return false;
+    }
+
+    // the ADD_ID adds the bias (src[1]) selected by the same expert ids the matmul consumed
+    if (add->src[0] != mul || add->src[2] != mul->src[2]) {
+        return false;
+    }
+
+    const ggml_tensor * bias = add->src[1];
+    if (bias->type != GGML_TYPE_F32 || !ggml_is_contiguous(bias)) {
+        return false;
+    }
+    if (bias->ne[0] != mul->ne[0] || bias->ne[1] != mul->src[0]->ne[2]) {
+        return false;
+    }
+
+    // the epilogue reads the bias and writes the destination in one dispatch
+    if (ggml_webgpu_tensor_binding_overlap(ctx->global_ctx, bias, add)) {
+        return false;
+    }
+
+    return true;
+}
+
 // Matches the build_moe_ffn expert aggregation: a MUL of the expert outputs by the router weights,
 // n_expert_used VIEWs of its expert rows and the n_expert_used-1 ADDs that sum them. The whole
 // reduction then becomes one kernel instead of 2*n_expert_used-1 dispatches.
@@ -4682,6 +4730,11 @@ static std::optional<webgpu_encoded_op> ggml_webgpu_encode(webgpu_context ctx,
             }
             return ggml_webgpu_mul_mat(ctx, src0, src1, node);
         case GGML_OP_MUL_MAT_ID:
+            if (ggml_webgpu_can_fuse_mul_mat_id_add_id(cgraph, node_idx, ctx)) {
+                ggml_tensor * add = nodes[node_idx + 1];
+                num_encoded_ops   = 2;
+                return ggml_webgpu_mul_mat_id_vec(ctx, src0, src1, src2, add, add->src[1]);
+            }
             return ggml_webgpu_mul_mat_id(ctx, src0, src1, src2, node);
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_webgpu_flash_attn(ctx, src0, src1, src2, node->src[3], node->src[4], node);
