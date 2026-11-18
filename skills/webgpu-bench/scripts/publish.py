@@ -48,14 +48,18 @@ def case_set_table(meta):
 
 
 def read_record(rec):
-    with open(os.path.join(rec, "status.json")) as f:
-        status = json.load(f).get("status")
-    if status not in VALID:
+    try:
+        with open(os.path.join(rec, "status.json")) as f:
+            status = json.load(f).get("status")
+        if status not in VALID:
+            return None
+        with open(os.path.join(rec, "meta.json")) as f:
+            meta = json.load(f)
+        with open(os.path.join(rec, "summary.md")) as f:
+            summary = f.read()
+    except (FileNotFoundError, ValueError):
+        # scratch / partial record dirs (e.g. *-ab A/B dirs) lack these files
         return None
-    with open(os.path.join(rec, "meta.json")) as f:
-        meta = json.load(f)
-    with open(os.path.join(rec, "summary.md")) as f:
-        summary = f.read()
     m = G_RE.search(summary)
     if not m:
         return None
