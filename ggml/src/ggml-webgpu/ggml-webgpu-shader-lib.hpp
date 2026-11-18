@@ -105,6 +105,7 @@ struct ggml_webgpu_shader_lib_context {
     uint32_t    min_subgroup_size        = 0;
     uint32_t    max_subgroup_size        = 0;
     bool        supports_dot_product     = false;
+    bool        flash_attn_v_wide        = false;
     std::string vendor;
 };
 
@@ -712,14 +713,18 @@ inline void ggml_webgpu_flash_attn_hash_common_pipeline_key(size_t &            
 
 struct ggml_webgpu_flash_attn_vec_pipeline_key {
     ggml_webgpu_flash_attn_common_pipeline_key common;
+    bool                                       v_wide;
 
-    bool operator==(const ggml_webgpu_flash_attn_vec_pipeline_key & other) const { return common == other.common; }
+    bool operator==(const ggml_webgpu_flash_attn_vec_pipeline_key & other) const {
+        return common == other.common && v_wide == other.v_wide;
+    }
 };
 
 struct ggml_webgpu_flash_attn_vec_pipeline_key_hash {
     size_t operator()(const ggml_webgpu_flash_attn_vec_pipeline_key & key) const {
         size_t seed = 0;
         ggml_webgpu_flash_attn_hash_common_pipeline_key(seed, key.common);
+        ggml_webgpu_hash_combine(seed, key.v_wide);
         return seed;
     }
 };
@@ -755,6 +760,8 @@ struct ggml_webgpu_flash_attn_decisions {
 };
 
 inline constexpr uint32_t GGML_WEBGPU_FLASH_ATTN_TILE_KV_VEC_WIDTH = 4u;
+// f16 elements per widened 16-byte V element (vec4<u32>) in the vec-flash direct path.
+inline constexpr uint32_t GGML_WEBGPU_FLASH_ATTN_TILE_V_WIDE_ELEMS = 8u;
 inline constexpr uint32_t GGML_WEBGPU_FLASH_ATTN_TILE_Q_TILE       = 4u;
 
 inline size_t ggml_webgpu_flash_attn_tensor_offset(const ggml_tensor * tensor) {
@@ -763,11 +770,18 @@ inline size_t ggml_webgpu_flash_attn_tensor_offset(const ggml_tensor * tensor) {
     return reinterpret_cast<uintptr_t>(base->data) - ptr_base_addr + tensor->view_offs;
 }
 
-inline bool ggml_webgpu_flash_attn_float_vec4_aligned(const ggml_tensor * K, size_t storage_offset_alignment) {
+inline bool ggml_webgpu_flash_attn_float_vec_aligned(const ggml_tensor * K,
+                                                     size_t              storage_offset_alignment,
+                                                     uint32_t            vec_width) {
     const uint32_t offset_elems =
         (uint32_t) ((ggml_webgpu_flash_attn_tensor_offset(K) & (storage_offset_alignment - 1)) /
                     ggml_type_size(K->type));
-    return offset_elems % GGML_WEBGPU_FLASH_ATTN_TILE_KV_VEC_WIDTH == 0u;
+    return offset_elems % vec_width == 0u;
+}
+
+inline bool ggml_webgpu_flash_attn_float_vec4_aligned(const ggml_tensor * K, size_t storage_offset_alignment) {
+    return ggml_webgpu_flash_attn_float_vec_aligned(K, storage_offset_alignment,
+                                                    GGML_WEBGPU_FLASH_ATTN_TILE_KV_VEC_WIDTH);
 }
 
 inline bool ggml_webgpu_flash_attn_float_vec4_aligned(const ggml_tensor * K,
@@ -775,6 +789,22 @@ inline bool ggml_webgpu_flash_attn_float_vec4_aligned(const ggml_tensor * K,
                                                       size_t              storage_offset_alignment) {
     return ggml_webgpu_flash_attn_float_vec4_aligned(K, storage_offset_alignment) &&
            ggml_webgpu_flash_attn_float_vec4_aligned(V, storage_offset_alignment);
+}
+
+// The widened 16-byte f16 V element view needs every element index the vec-flash shader forms to be
+// a multiple of 8: the binding starts at a multiple of minStorageBufferOffsetAlignment and the
+// shader folds the tensor misalignment into offset_v.
+inline bool ggml_webgpu_flash_attn_v_wide_aligned(const ggml_tensor * V, size_t storage_offset_alignment) {
+    if (storage_offset_alignment % GGML_WEBGPU_FLASH_ATTN_TILE_V_WIDE_ELEMS != 0u) {
+        return false;
+    }
+    const size_t type_size = ggml_type_size(V->type);
+    return V->type == GGML_TYPE_F16 && V->ne[0] % GGML_WEBGPU_FLASH_ATTN_TILE_V_WIDE_ELEMS == 0 &&
+           (V->nb[1] / type_size) % GGML_WEBGPU_FLASH_ATTN_TILE_V_WIDE_ELEMS == 0 &&
+           (V->nb[2] / type_size) % GGML_WEBGPU_FLASH_ATTN_TILE_V_WIDE_ELEMS == 0 &&
+           (V->nb[3] / type_size) % GGML_WEBGPU_FLASH_ATTN_TILE_V_WIDE_ELEMS == 0 &&
+           ggml_webgpu_flash_attn_float_vec_aligned(V, storage_offset_alignment,
+                                                    GGML_WEBGPU_FLASH_ATTN_TILE_V_WIDE_ELEMS);
 }
 
 inline bool ggml_webgpu_flash_attn_k_direct(const ggml_tensor * Q, const ggml_tensor * K, uint32_t kv_direct_align) {
@@ -3402,6 +3432,9 @@ class ggml_webgpu_shader_lib {
         ggml_webgpu_flash_attn_vec_pipeline_key key = {};
         key.common = ggml_webgpu_flash_attn_make_common_pipeline_key(context, GGML_WEBGPU_FLASH_ATTN_TILE_KV_VEC_WIDTH,
                                                                      kv_overlap);
+        // Widen the f16 direct-path V loads to 16 bytes when the cache geometry allows it. The
+        // widened storage is a different shader, so the flag is part of the pipeline key.
+        key.v_wide = context.flash_attn_v_wide && key.common.v_direct && !kv_overlap;
 
         auto it = flash_attn_vec_pipelines.find(key);
         if (it != flash_attn_vec_pipelines.end()) {
@@ -3421,6 +3454,10 @@ class ggml_webgpu_shader_lib {
             defines.push_back("BLK");
             variant.resize(variant.size() - (sizeof("_mask") - 1));
             variant += "_mask_blk";
+        }
+        if (key.v_wide) {
+            defines.push_back("V_F16_WIDE");
+            variant += "_vwide";
         }
 
         uint32_t       d_split = context.min_subgroup_size;

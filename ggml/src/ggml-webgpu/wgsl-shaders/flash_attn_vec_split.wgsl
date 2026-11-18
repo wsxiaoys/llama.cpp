@@ -60,6 +60,27 @@ fn calc_softmax_term(kv_idx: u32, slope: f32, has_bias: bool, apply_mask: bool) 
     return v;
 }
 
+// Reduce one vec4 output-column accumulator over the `ne_threads` ty lanes of the P*V mapping.
+fn pv_reduce_ty(v: vec4<f32>, ne_threads: u32, nl_threads: u32, ty_pv: u32) -> vec4<f32> {
+    var acc = v;
+    var ty_delta = ne_threads >> 1u;
+    loop {
+        if (ty_delta == 0u) {
+            break;
+        }
+        let thread_delta = ty_delta * nl_threads;
+        let shx = subgroupShuffleDown(acc.x, thread_delta);
+        let shy = subgroupShuffleDown(acc.y, thread_delta);
+        let shz = subgroupShuffleDown(acc.z, thread_delta);
+        let shw = subgroupShuffleDown(acc.w, thread_delta);
+        if (ty_pv < ty_delta) {
+            acc += vec4<f32>(shx, shy, shz, shw);
+        }
+        ty_delta >>= 1u;
+    }
+    return acc;
+}
+
 @compute @workgroup_size(WG_SIZE)
 fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
     @builtin(local_invocation_id) local_id: vec3<u32>,
@@ -344,6 +365,45 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
           let tx_pv = sg_inv_id % nl_threads;
           let ty_pv = sg_inv_id / nl_threads;
           if (subgroup_id == 0u && q_row_start < params.seq_len_q) {
+#ifdef V_F16_WIDE
+              // One 16-byte load covers two adjacent 4-wide output-column groups; each half keeps
+              // its own accumulator and the ty reduction of the 8-byte path.
+              for (var vec_col = tx_pv; vec_col < (HEAD_DIM_V / 8u); vec_col += nl_threads) {
+                  var lo = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+                  var hi = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+                  for (var cc = 0u; cc * ne_threads < KV_TILE; cc += 1u) {
+                      let kv_idx = cc * ne_threads + ty_pv;
+                      if (kv_idx >= KV_TILE) {
+                          continue;
+                      }
+                      let v_row = kv_tile + kv_idx;
+                      if (v_row >= params.seq_len_kv) {
+                          continue;
+                      }
+
+                      let p = inter_shmem[kv_idx];
+                      let v_idx = v_head_offset + v_row * params.stride_v1 + vec_col * 8u;
+                      let v8 = V[v_idx >> 3u];
+                      lo += p * vec4<f32>(unpack2x16float(v8.x), unpack2x16float(v8.y));
+                      hi += p * vec4<f32>(unpack2x16float(v8.z), unpack2x16float(v8.w));
+                  }
+
+                  let lo_r = pv_reduce_ty(lo, ne_threads, nl_threads, ty_pv);
+                  let hi_r = pv_reduce_ty(hi, ne_threads, nl_threads, ty_pv);
+
+                  if (ty_pv == 0u) {
+                      let elem_base = vec_col * 8u;
+                      o_shmem[elem_base + 0u] = o_shmem[elem_base + 0u] + lo_r.x;
+                      o_shmem[elem_base + 1u] = o_shmem[elem_base + 1u] + lo_r.y;
+                      o_shmem[elem_base + 2u] = o_shmem[elem_base + 2u] + lo_r.z;
+                      o_shmem[elem_base + 3u] = o_shmem[elem_base + 3u] + lo_r.w;
+                      o_shmem[elem_base + 4u] = o_shmem[elem_base + 4u] + hi_r.x;
+                      o_shmem[elem_base + 5u] = o_shmem[elem_base + 5u] + hi_r.y;
+                      o_shmem[elem_base + 6u] = o_shmem[elem_base + 6u] + hi_r.z;
+                      o_shmem[elem_base + 7u] = o_shmem[elem_base + 7u] + hi_r.w;
+                  }
+              }
+#else
               for (var vec_col = tx_pv; vec_col < (HEAD_DIM_V / 4u); vec_col += nl_threads) {
                   var lo = vec4<f32>(0.0, 0.0, 0.0, 0.0);
                   for (var cc = 0u; cc * ne_threads < KV_TILE; cc += 1u) {
@@ -432,6 +492,7 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
                       o_shmem[elem_base + 3u] = o_shmem[elem_base + 3u] + lo_w;
                   }
               }
+#endif // defined(V_F16_WIDE)
           }
       }
 

@@ -34,6 +34,9 @@
 
 #if defined(FLASH_ATTN_SCALAR_KV) || defined(V_Q4_0) || defined(V_Q8_0)
 #define V_STORAGE_TYPE V_TYPE
+#elif defined(V_F16_WIDE)
+// 8 f16 per element (16 bytes) so the vec path can load two vec4<f16> per instruction.
+#define V_STORAGE_TYPE vec4<u32>
 #else
 #define V_STORAGE_TYPE vec4<V_TYPE>
 #endif

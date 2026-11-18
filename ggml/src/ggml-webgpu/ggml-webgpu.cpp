@@ -2706,6 +2706,8 @@ static ggml_webgpu_flash_attn_op ggml_webgpu_flash_attn_prepare(webgpu_context &
     op.shader_lib_ctx.sg_mat_k                 = ctx->global_ctx->capabilities.sg_mat_k;
     op.shader_lib_ctx.min_subgroup_size        = ctx->global_ctx->capabilities.min_subgroup_size;
     op.shader_lib_ctx.max_subgroup_size        = ctx->global_ctx->capabilities.max_subgroup_size;
+    op.shader_lib_ctx.flash_attn_v_wide =
+        ggml_webgpu_flash_attn_v_wide_aligned(V, ctx->global_ctx->capabilities.limits.minStorageBufferOffsetAlignment);
 
     op.has_mask   = mask != nullptr;
     op.has_sinks  = sinks != nullptr;
